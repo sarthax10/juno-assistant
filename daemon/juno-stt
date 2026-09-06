@@ -1,0 +1,144 @@
+#!/home/sandbox/.local/share/juno/venv/bin/python
+"""
+Juno's speech recognition worker.
+
+One resident CTranslate2 model. A WAV path in on stdin, one line of JSON out
+on stdout:
+
+    {"text": "...", "language": "hi", "probability": 0.99, "seconds": 2.8}
+
+Why not whisper.cpp: on this machine it needed 30 to 100 seconds for a
+two-second Hindi clip, because Devanagari tokenizes into far more tokens
+than Latin and whisper decodes autoregressively. The same model in
+CTranslate2 int8 does it in five to twelve. Language is detected per
+utterance, so English and Hindi need no mode switch.
+"""
+
+import json
+import os
+import sys
+
+from faster_whisper import WhisperModel
+
+SIZE = os.environ.get("JUNO_STT_MODEL", "base")
+# A second, Hindi-specialised model. Measured on this machine:
+#   base            English perfect in 3s   Hindi garbled  ("कम्पिय।र में कितनी डम")
+#   small-hindi     Hindi perfect in 7-10s  English ruined (transliterated to Devanagari)
+# Neither is good at both, so each utterance goes to the one that suits it.
+HINDI_MODEL = os.environ.get("JUNO_STT_MODEL_HI", "")
+# A larger model for commands. The fast one is fine on clean speech and
+# falls apart in a room: "can you set an alarm at 10 AM", recorded through
+# this user's room, came back from base as "We need certain amount of time
+# to get here" and from small as "Can you set an alarm at 10.00?". Waiting
+# is better than being misunderstood, so commands pay for the bigger model
+# and the idle wake path never touches it.
+ACCURATE_MODEL = os.environ.get("JUNO_STT_MODEL_ACCURATE", "")
+HINDI_MIN_PROB = float(os.environ.get("JUNO_STT_HI_PROB", "0.55"))
+THREADS = int(os.environ.get("JUNO_STT_THREADS", "6"))
+COMPUTE = os.environ.get("JUNO_STT_COMPUTE", "int8")
+LANGUAGE = os.environ.get("JUNO_STT_LANGUAGE", "auto")
+PROMPT = os.environ.get("JUNO_STT_PROMPT", "")
+ROOT = os.environ.get("JUNO_STT_ROOT", os.path.expanduser("~/.local/share/juno/fw"))
+
+
+def load(name):
+    return WhisperModel(name, device="cpu", compute_type=COMPUTE,
+                        cpu_threads=THREADS, download_root=ROOT)
+
+
+def run(model, path, language):
+    segments, info = model.transcribe(
+        path,
+        language=language,
+        beam_size=1,
+        temperature=[0.0, 0.2, 0.4, 0.6],
+        compression_ratio_threshold=2.2,
+        repetition_penalty=1.15,
+        no_repeat_ngram_size=4,
+        condition_on_previous_text=False,
+        initial_prompt=PROMPT or None,
+        vad_filter=True,
+        # Juno's own energy VAD already delivers a tight segment with 300ms
+        # of lead-in. Without generous padding here, faster-whisper's VAD
+        # trims that lead-in and eats the wake word: "Hey Juno, how many CPU
+        # cores" came back as "How many CPU cores".
+        vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 800},
+    )
+    return list(segments), info
+
+
+def summarize(collected, info, result):
+    result["text"] = " ".join(s.text for s in collected).strip()
+    result["language"] = info.language or ""
+    result["probability"] = round(float(info.language_probability or 0), 3)
+    result["seconds"] = round(float(info.duration or 0), 2)
+    if collected:
+        result["no_speech"] = round(
+            max(float(s.no_speech_prob or 0) for s in collected), 3)
+        result["logprob"] = round(
+            sum(float(s.avg_logprob or 0) for s in collected) / len(collected), 3)
+    return result
+
+
+def main():
+    model = load(SIZE)
+    hindi = None                       # loaded on the first Hindi utterance
+    accurate_model = None              # loaded on the first command
+    print("READY", file=sys.stderr, flush=True)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        # "<path>" or "<path>\tfull". While Juno is only listening for her
+        # name, the fast model is enough: it renders "Juno"/"Juneau" legibly
+        # even in Hindi speech, and that is the only word that matters. The
+        # accurate Hindi model is thirteen seconds a go, so escalating for
+        # every passing song was burning a core to transcribe lyrics nobody
+        # reads. Escalation now happens only once a wake has been matched.
+        path, _, mode = line.partition("\t")
+        want_accurate = mode == "full"
+        result = {"text": "", "language": "", "probability": 0.0,
+                  "no_speech": 1.0, "logprob": -10.0}
+        try:
+            # Which model goes first depends on what this audio is for.
+            #
+            # Waiting for the wake word: the fast model, and nothing else.
+            # Taking a command: the accurate model directly. It is
+            # multilingual, so it does its own language detection — running
+            # the fast model first purely to find out the language meant
+            # transcribing every command twice and throwing the first result
+            # away, which is three seconds the user sat through for nothing.
+            first = model
+            if want_accurate and ACCURATE_MODEL:
+                if accurate_model is None:
+                    print(f"LOADING {ACCURATE_MODEL}", file=sys.stderr, flush=True)
+                    accurate_model = load(ACCURATE_MODEL)
+                    print("LOADED", file=sys.stderr, flush=True)
+                first = accurate_model
+            collected, info = run(first, path,
+                                  None if LANGUAGE == "auto" else LANGUAGE)
+            summarize(collected, info, result)
+            result["model"] = "accurate" if first is not model else "primary"
+
+            # Hindi gets one more pass, on the model that actually knows it.
+            if (want_accurate and HINDI_MODEL
+                    and result["language"] == "hi"
+                    and result["probability"] >= HINDI_MIN_PROB
+                    and result["text"]):
+                if hindi is None:
+                    print(f"LOADING {HINDI_MODEL}", file=sys.stderr, flush=True)
+                    hindi = load(HINDI_MODEL)
+                    print("LOADED", file=sys.stderr, flush=True)
+                collected, info = run(hindi, path, "hi")
+                summarize(collected, info, result)
+                result["language"] = "hi"
+                result["model"] = "hindi"
+        except Exception as exc:
+            result["error"] = f"{type(exc).__name__}: {exc}"
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

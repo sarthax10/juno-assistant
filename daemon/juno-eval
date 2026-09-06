@@ -1,0 +1,130 @@
+#!/home/sandbox/.local/share/juno/venv/bin/python
+"""
+Measure recognition on a real human voice — yours.
+
+Every number produced before this tool came from synthetic speech played
+through the speakers. That audio is clean, evenly paced, and always the same
+distance from the microphone, and it flattered the system badly: the shipped
+wake model scored 0.97 on it and 0.045 on the person actually using this
+machine.
+
+This reads you a set of realistic commands, records you saying each one,
+runs them through the same pipeline a real command takes, and reports word
+error rate. It keeps every recording, so the failures can be listened to and
+the thresholds tuned against them rather than against a text-to-speech
+voice.
+"""
+
+import difflib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import wave
+
+PHRASES = [
+    "set an alarm at ten a m",
+    "what is my battery level",
+    "open my terminal",
+    "how much disk space do I have left",
+    "turn the volume down",
+    "what time is it",
+    "remind me in twenty minutes to take a break",
+    "list the files in my home folder",
+]
+
+SHARE = os.path.expanduser("~/.local/share/juno")
+OUT = os.path.join(SHARE, "eval")
+RATE = 16000
+
+
+def normalise(text):
+    text = re.sub(r"[^a-z0-9 ]", " ", text.lower())
+    return [w for w in text.split() if w]
+
+
+def wer(truth, heard):
+    """Word error rate via an alignment, the standard measure."""
+    t, h = normalise(truth), normalise(heard)
+    if not t:
+        return 0.0 if not h else 1.0
+    matcher = difflib.SequenceMatcher(None, t, h)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return max(0.0, (len(t) - matched) / len(t))
+
+
+def record(seconds):
+    proc = subprocess.Popen(
+        ["timeout", str(seconds + 1), "pw-record", "--raw", "--rate", str(RATE),
+         "--channels", "1", "--format", "s16", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    raw = proc.stdout.read()
+    proc.wait()
+    return raw
+
+
+def main():
+    seconds = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    os.makedirs(OUT, exist_ok=True)
+
+    sys.path.insert(0, SHARE)
+    code = open(os.path.join(SHARE, "juno-daemon")).read()
+    daemon = type(sys)("jd")
+    daemon.__dict__["__name__"] = "jd"
+    exec(compile(code, "juno-daemon", "exec"), daemon.__dict__)
+    cfg = daemon.load_config()
+
+    print("Speak each line normally, at the distance and volume you actually")
+    print("use. Recording starts when you press Enter and runs for "
+          f"{seconds} seconds.\n")
+
+    stt = daemon.Whisper(cfg)
+    stt.start()
+
+    results = []
+    for i, phrase in enumerate(PHRASES):
+        input(f'[{i + 1}/{len(PHRASES)}]  "{phrase}"\n   Enter to record... ')
+        raw = record(seconds)
+        path = os.path.join(OUT, f"{i:02d}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+            w.writeframes(raw)
+        started = time.time()
+        heard = stt.transcribe(raw, accurate=True)
+        elapsed = time.time() - started
+        error = wer(phrase, heard)
+        results.append({"truth": phrase, "heard": heard, "wer": error,
+                        "seconds": round(elapsed, 1), "file": path})
+        mark = "ok  " if error <= 0.25 else "MISS"
+        print(f"   {mark} {elapsed:4.1f}s  {error * 100:3.0f}% error   {heard}\n")
+
+    stt.stop()
+
+    overall = sum(r["wer"] for r in results) / len(results)
+    slowest = max(r["seconds"] for r in results)
+    print("=" * 62)
+    print(f"  word error rate on your voice: {overall * 100:.0f}%")
+    print(f"  clean transcriptions: {sum(1 for r in results if r['wer'] <= 0.25)}"
+          f"/{len(results)}")
+    print(f"  slowest: {slowest:.1f}s")
+    print(f"  recordings kept in {OUT}")
+    with open(os.path.join(OUT, "results.json"), "w") as fh:
+        json.dump(results, fh, indent=2, ensure_ascii=False)
+    print(f"  results in {os.path.join(OUT, 'results.json')}")
+    print()
+    if overall > 0.5:
+        print("  Most words are being lost. That is a signal problem, not a")
+        print("  model problem — check `jarvis miccheck` for how far your")
+        print("  voice rises above the room.")
+    elif overall > 0.25:
+        print("  Usable but unreliable. Send me results.json and I will tune")
+        print("  against these recordings rather than synthetic speech.")
+    else:
+        print("  Good. Send me results.json anyway so the numbers are on record.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

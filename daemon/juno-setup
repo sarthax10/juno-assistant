@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Juno setup — installs the speech engines and models.
+# Safe to re-run: every step is a no-op once it has succeeded.
+set -uo pipefail
+
+SHARE="$HOME/.local/share/juno"
+MODEL="$SHARE/models/ggml-base.en.bin"
+VOICE="$SHARE/voices/en_US-amy-medium.onnx"
+MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx"
+
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+blue()  { printf '\033[34m%s\033[0m\n' "$*"; }
+warn()  { printf '\033[33m%s\033[0m\n' "$*"; }
+
+blue "── Juno setup ─────────────────────────────────────────"
+echo
+
+# 1. Speech recognition -------------------------------------------------
+if command -v whisper-server >/dev/null || command -v whisper-cli >/dev/null; then
+  green "✓ whisper-cpp already installed"
+else
+  blue "Installing whisper-cpp (speech recognition)…"
+  sudo pacman -S --needed --noconfirm whisper-cpp || warn "! whisper-cpp failed"
+fi
+
+# 2. Speech synthesis ---------------------------------------------------
+if command -v piper >/dev/null && piper --help 2>&1 | grep -qi onnx; then
+  green "✓ piper already installed"
+else
+  blue "Installing piper-tts (neural voice) from the AUR…"
+  if ! yay -S --needed --noconfirm piper-tts 2>/dev/null; then
+    warn "! piper-tts unavailable — falling back to espeak-ng"
+    sudo pacman -S --needed --noconfirm espeak-ng || warn "! espeak-ng failed"
+  fi
+fi
+
+# 3. Models -------------------------------------------------------------
+mkdir -p "$SHARE/models" "$SHARE/voices"
+if [ -s "$MODEL" ]; then
+  green "✓ whisper model present"
+else
+  blue "Downloading the whisper base.en model (142 MB)…"
+  curl -fL --retry 3 -o "$MODEL" "$MODEL_URL" || warn "! model download failed"
+fi
+if [ -s "$VOICE" ]; then
+  green "✓ piper voice present"
+else
+  blue "Downloading the Amy voice (61 MB)…"
+  curl -fL --retry 3 -o "$VOICE" "$VOICE_URL" \
+    && curl -fL --retry 3 -o "$VOICE.json" "$VOICE_URL.json" \
+    || warn "! voice download failed"
+fi
+
+# 4. Service ------------------------------------------------------------
+blue "Restarting the Juno service…"
+systemctl --user daemon-reload
+systemctl --user enable --now juno.service
+sleep 3
+
+echo
+blue "── Result ─────────────────────────────────────────────"
+juno status >/dev/null 2>&1 && green "✓ daemon responding" || warn "! daemon not responding"
+command -v whisper-server >/dev/null && green "✓ speech recognition ready" \
+  || warn "! no whisper binary — voice input disabled, typing still works"
+(command -v piper >/dev/null || command -v espeak-ng >/dev/null) \
+  && green "✓ voice output ready" || warn "! no TTS — Juno will stay silent"
+echo
+green "Say “Juno” to wake her, or press Super+J."
+echo
+read -rp "Press Enter to close… "

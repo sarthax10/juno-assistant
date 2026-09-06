@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+PreToolUse hook for Juno's scoped-auto mode.
+
+Juno runs Claude with permissions bypassed on purpose — an assistant that
+stops to ask before every edit is not an assistant. This stands in the way
+of the small set of commands that a misheard sentence must never be able to
+produce. Everything else runs.
+
+Denied calls carry a JUNO_BLOCKED marker so the daemon can surface an
+"allow once" card in the overlay instead of the user wondering what happened.
+"""
+
+import json
+import re
+import sys
+
+PATTERNS = [
+    (r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+", "a recursive or forced delete"),
+    (r"\bsudo\b", "a command needing root"),
+    (r"\bpkexec\b", "a command needing root"),
+    (r"\bmkfs(\.\w+)?\b", "a filesystem format"),
+    (r"\bdd\b[^|;]*\bof=/dev/", "a raw write to a block device"),
+    (r">\s*/dev/(sd|nvme|mmcblk|disk)", "a raw write to a block device"),
+    (r"\b(shutdown|reboot|poweroff|halt|systemctl\s+(poweroff|reboot))\b",
+     "a power state change"),
+    (r"\bgit\s+push\b[^|;]*\s(--force\b|-f\b)", "a force push"),
+    (r"\bgit\s+reset\s+--hard\b", "a hard reset that discards work"),
+    (r"\bgit\s+clean\s+-[a-zA-Z]*[fd]", "a git clean that deletes files"),
+    (r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|k|d)?sh\b", "a pipe-to-shell install"),
+    (r":\s*\(\s*\)\s*\{.*\|.*&.*\}", "a fork bomb"),
+    (r"\bchmod\s+(-R\s+)?(777|a\+rwx)\s+/", "world-writable permissions on a system path"),
+    (r"\b(userdel|usermod|passwd|visudo)\b", "an account or sudoers change"),
+    (r"\bpacman\s+-R", "a package removal"),
+    (r"\bcrontab\s+-r", "wiping the crontab"),
+    (r"\bkillall5\b|\bkill\s+-9\s+1\b", "killing init"),
+    (r"\btruncate\s+-s\s*0\s+/", "truncating a system file"),
+    (r"\b(mv|cp)\s+[^|;]*\s+/(etc|boot|usr|bin|sbin|lib)(/|\s|$)",
+     "writing into a system directory"),
+]
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)
+
+    command = str((event.get("tool_input") or {}).get("command") or "")
+    if not command:
+        sys.exit(0)
+
+    for pattern, description in PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            reason = (
+                f"JUNO_BLOCKED: {description}. Juno will not run this from a "
+                "voice command. Tell the user exactly what you wanted to run "
+                "and why, then stop — do not attempt a workaround."
+            )
+            json.dump({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }, sys.stdout)
+            sys.exit(0)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Optional: stop Juno hearing your own speakers.
+#
+# The laptop microphone picks up whatever the speakers play, so music or
+# video is transcribed continuously and can drown out your voice. WebRTC
+# echo cancellation subtracts the playback signal from the microphone.
+#
+# The catch: cancellation needs the playback as a reference, so audio has to
+# travel through a virtual sink. This script makes that sink the default
+# output, which changes the audio path for every application, not just Juno.
+# Headphones solve the same problem with no configuration at all.
+#
+#   juno-echo-cancel on     enable and make it the default
+#   juno-echo-cancel off    remove it and restore the previous default
+set -euo pipefail
+
+CONF_DIR="$HOME/.config/pipewire/pipewire.conf.d"
+CONF="$CONF_DIR/99-juno-echo-cancel.conf"
+
+case "${1:-}" in
+on)
+  mkdir -p "$CONF_DIR"
+  cat > "$CONF" <<'CONF'
+context.modules = [
+  { name = libpipewire-module-echo-cancel
+    args = {
+      library.name = aec/libspa-aec-webrtc
+      capture.props  = { node.passive = true }
+      playback.props = { node.passive = true }
+      source.props   = { node.name = "juno_mic"
+                         node.description = "Microphone (echo cancelled)" }
+      sink.props     = { node.name = "juno_speaker"
+                         node.description = "Speakers (echo cancelled)" }
+      aec.args = {
+        webrtc.gain_control      = true
+        webrtc.noise_suppression = true
+        webrtc.high_pass_filter  = true
+        webrtc.echo_suppression_level = 2
+      }
+    }
+  }
+]
+CONF
+  systemctl --user restart pipewire pipewire-pulse
+  sleep 3
+  pactl set-default-sink juno_speaker
+  pactl set-default-source juno_mic
+  systemctl --user restart juno.service
+  echo "Echo cancellation on. Default output is now 'Speakers (echo cancelled)'."
+  echo "Anything playing through it is subtracted from what Juno hears."
+  ;;
+off)
+  rm -f "$CONF"
+  systemctl --user restart pipewire pipewire-pulse
+  sleep 3
+  # Fall back to the first real hardware device.
+  sink=$(pactl list short sinks | grep alsa_output | head -1 | awk '{print $2}')
+  # Prefer the built-in digital mic array. Picking the first alsa_input
+  # lands on the headset jack, which is silent with nothing plugged in.
+  src=$(pactl list short sources | grep alsa_input | grep -i 'Mic1' | head -1 | awk '{print $2}')
+  [ -z "$src" ] && src=$(pactl list short sources | grep alsa_input | head -1 | awk '{print $2}')
+  [ -n "$sink" ] && pactl set-default-sink "$sink"
+  [ -n "$src" ] && pactl set-default-source "$src"
+  systemctl --user restart juno.service
+  echo "Echo cancellation off. Restored the hardware devices."
+  ;;
+*)
+  echo "usage: juno-echo-cancel on|off"
+  exit 2
+  ;;
+esac

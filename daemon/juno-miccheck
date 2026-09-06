@@ -1,0 +1,84 @@
+#!/home/sandbox/.local/share/juno/venv/bin/python
+"""
+Record a few seconds and report what the wake detector made of it.
+
+Answers the question the logs cannot: when you say the phrase and nothing
+happens, was your voice too quiet, was it drowned by the room, or did it
+reach the model and simply not score high enough?
+"""
+import json
+import os
+import subprocess
+import sys
+import wave
+
+import numpy as np
+from openwakeword.model import Model
+
+SECONDS = int(sys.argv[1]) if len(sys.argv) > 1 else 6
+SHARE = os.path.expanduser("~/.local/share/juno")
+CFG = os.path.expanduser("~/.config/juno/config.json")
+
+
+def main():
+    try:
+        cfg = json.load(open(CFG))
+    except Exception:
+        cfg = {}
+    phrase = cfg.get("wakeWord", "Jarvis")
+    threshold = float(cfg.get("wakeThreshold", 0.35))
+    model_name = cfg.get("wakeModel", "hey_jarvis_v0.1.onnx")
+
+    print(f'Say "Hey {phrase}" now — recording {SECONDS} seconds...', flush=True)
+    raw = subprocess.run(
+        ["pw-record", "--raw", "--rate", "16000", "--channels", "1",
+         "--format", "s16", "-"],
+        capture_output=True, timeout=SECONDS + 4).stdout if False else None
+    proc = subprocess.Popen(
+        ["timeout", str(SECONDS), "pw-record", "--raw", "--rate", "16000",
+         "--channels", "1", "--format", "s16", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    raw = proc.stdout.read()
+    proc.wait()
+
+    if not raw:
+        print("No audio captured at all — the microphone is not delivering.")
+        return 1
+
+    audio = np.frombuffer(raw, dtype=np.int16)
+    frames = [audio[i:i + 320] for i in range(0, len(audio) - 320, 320)]
+    levels = sorted(float(np.sqrt(np.mean(f.astype(np.float64) ** 2)) / 32768)
+                    for f in frames)
+    median, peak = levels[len(levels) // 2], levels[-1]
+
+    base = os.path.join(os.path.dirname(__import__("openwakeword").__file__),
+                        "resources", "models")
+    path = model_name if os.path.isabs(model_name) else os.path.join(base, model_name)
+    model = Model(wakeword_model_paths=[path])
+    best = 0.0
+    for i in range(0, len(audio) - 1280, 1280):
+        best = max(best, max(model.predict(audio[i:i + 1280]).values()))
+
+    print()
+    print(f"  background level   {median:.4f}   (a quiet room is about 0.005)")
+    print(f"  loudest moment     {peak:.4f}")
+    print(f"  best wake score    {best:.3f}   (needs {threshold})")
+    print()
+    if best >= threshold:
+        print(f"  PASS — that would have woken {phrase}.")
+    elif peak < median * 3:
+        print("  Your voice never rose above the room. Either the microphone")
+        print("  did not pick you up, or the background is as loud as you are.")
+        print("  Move closer to the microphone and try again.")
+    elif best >= threshold * 0.5:
+        print(f"  Close — it heard the phrase but scored {best:.2f}. Lower the")
+        print(f"  bar with:  jarvis threshold {max(0.15, best - 0.05):.2f}")
+    else:
+        print("  Your voice reached the microphone clearly, but the model did")
+        print(f"  not recognise the phrase. Say it as one phrase — \"hey {phrase.lower()}\" —")
+        print("  rather than pausing between the two words.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,113 @@
+#!/home/sandbox/.local/share/juno/venv/bin/python
+"""
+Juno's neural voice worker.
+
+Speaks the same protocol as `piper --output-raw`, so the daemon's engine
+plumbing is unchanged: one line of text in on stdin, raw mono s16 PCM out
+on stdout. Two things are added on stderr, because Kokoro is slower than
+piper and the daemon needs to be exact rather than heuristic:
+
+    READY <sample_rate>     the model is loaded
+    DONE <sample_count>     that line is fully synthesized
+
+Kokoro runs at roughly nine tenths of real time on this CPU, so a whole
+reply cannot be synthesized before playback would need it. Instead each
+sentence is written the moment it exists: speech starts after the first
+short sentence rather than after the last long one, and if the synthesizer
+does fall behind, the gap lands on a sentence boundary where it reads as
+someone drawing breath.
+"""
+
+import os
+import re
+import sys
+
+import numpy as np
+from kokoro_onnx import Kokoro
+
+SHARE = os.path.expanduser("~/.local/share/juno")
+MODEL = os.environ.get("JUNO_KOKORO_MODEL", os.path.join(SHARE, "kokoro/kokoro-v1.0.onnx"))
+VOICES = os.environ.get("JUNO_KOKORO_VOICES", os.path.join(SHARE, "kokoro/voices-v1.0.bin"))
+VOICE = os.environ.get("JUNO_KOKORO_VOICE", "af_heart")
+VOICE_HI = os.environ.get("JUNO_KOKORO_VOICE_HI", "hf_alpha")
+HINDI_VOICE_ENABLED = os.environ.get("JUNO_KOKORO_HINDI", "0") == "1"
+SPEED = float(os.environ.get("JUNO_KOKORO_SPEED", "1.0"))
+# Kokoro's Hindi runs together at full speed; a little slower is markedly
+# clearer without sounding laboured.
+SPEED_HI = float(os.environ.get("JUNO_KOKORO_SPEED_HI", "0.88"))
+LANG = os.environ.get("JUNO_KOKORO_LANG", "en-us")
+
+# Split on sentence enders, but keep the ender attached so the model still
+# hears the question mark and gives the line its rising intonation.
+# Devanagari ends sentences with a danda (।) as often as a full stop.
+SENTENCE = re.compile(r"(?<=[.!?…।])\s+")
+MAX_CHUNK = 220
+
+DEVANAGARI = re.compile(r"[\u0900-\u097f]")
+
+
+def voice_for(text):
+    """Always the English voice.
+
+    Kokoro's Hindi voices are slow and indistinct to the point of being
+    unusable, so Juno understands Hindi but answers in English. The
+    Devanagari check stays only as a safety net: if a stray Hindi sentence
+    ever reaches here it gets the Hindi voice rather than an English voice
+    trying to read Devanagari, which produces nothing at all.
+    """
+    if HINDI_VOICE_ENABLED and DEVANAGARI.search(text):
+        return (VOICE_HI, "hi", SPEED_HI)
+    return (VOICE, LANG, SPEED)
+
+
+def chunks(text):
+    for sentence in SENTENCE.split(text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= MAX_CHUNK:
+            yield sentence
+            continue
+        # A sentence longer than the chunk cap gets broken at a comma so the
+        # seam falls somewhere the ear expects a pause.
+        part = ""
+        for piece in sentence.split(", "):
+            candidate = (part + ", " + piece) if part else piece
+            if len(candidate) > MAX_CHUNK and part:
+                yield part
+                part = piece
+            else:
+                part = candidate
+        if part:
+            yield part
+
+
+def main():
+    kokoro = Kokoro(MODEL, VOICES)
+    out = sys.stdout.buffer
+    rate = None
+
+    for line in sys.stdin:
+        text = line.strip()
+        if not text:
+            continue
+        total = 0
+        for chunk in chunks(text):
+            voice, lang, speed = voice_for(chunk)
+            try:
+                samples, sr = kokoro.create(chunk, voice=voice, speed=speed, lang=lang)
+            except Exception as exc:
+                print(f"ERROR {exc}", file=sys.stderr, flush=True)
+                continue
+            if rate is None:
+                rate = sr
+                print(f"READY {rate}", file=sys.stderr, flush=True)
+            pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+            out.write(pcm)
+            out.flush()          # play this sentence while the next is made
+            total += len(samples)
+        print(f"DONE {total}", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()

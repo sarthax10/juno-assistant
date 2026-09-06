@@ -1,0 +1,218 @@
+#!/home/sandbox/.local/share/juno/venv/bin/python
+"""
+Wake-word detector.
+
+Raw 16kHz mono s16 PCM in on stdin, one JSON line out per detection:
+
+    {"model": "HEY JARVIS", "score": 1.0}
+
+Two engines. The default is sherpa-onnx keyword spotting, which is a tiny
+transducer ASR constrained to a list of phrases — it asks "did they say one
+of these words" rather than "does this audio resemble a phrase I was trained
+on", and the difference showed up immediately when both were measured on
+this user's own recordings:
+
+                        wake in room   false wakes
+    openWakeWord        yes            262 in 3 hours (87/hr)
+    sherpa-onnx KWS     yes            0 across 48s of their speech
+
+openWakeWord's own target is under 0.5 false accepts an hour, so 87 was a
+configuration failure rather than a model failure — the threshold had been
+dragged down to 0.30 to catch a voice that scored 0.41, and everything else
+came with it. There is no threshold that separates those two numbers. The
+keyword spotter does not have that problem because the phrases are decoded,
+not classified, and it takes any phrase as plain text with no training.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+
+ENGINE = os.environ.get("JUNO_WAKE_ENGINE", "sherpa")
+STEP = 1280
+FRAME = STEP * int(os.environ.get("JUNO_WAKE_FRAMES", "3"))
+COOLDOWN_FRAMES = max(1, int(float(os.environ.get("JUNO_WAKE_COOLDOWN", "1.5"))
+                            / (FRAME / 16000)))
+
+SHARE = os.path.expanduser("~/.local/share/juno")
+KWS_DIR = os.environ.get("JUNO_KWS_DIR", os.path.join(SHARE, "kws"))
+PHRASES = os.environ.get("JUNO_WAKE_PHRASES", "HEY JARVIS")
+KWS_SCORE = float(os.environ.get("JUNO_KWS_SCORE", "4.0"))
+KWS_THRESHOLD = float(os.environ.get("JUNO_KWS_THRESHOLD", "0.01"))
+
+THRESHOLD = float(os.environ.get("JUNO_WAKE_THRESHOLD", "0.5"))
+REPORT = float(os.environ.get("JUNO_WAKE_REPORT", "0.15"))
+MODELS = os.environ.get("JUNO_WAKE_MODELS", "hey_jarvis_v0.1.onnx")
+PERSONAL = os.environ.get("JUNO_WAKE_PERSONAL",
+                          os.path.join(SHARE, "personal-wake.npz"))
+
+
+def read_exact(stream, size):
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = stream.read(size - len(chunks))
+        if not chunk:
+            return None
+        chunks += chunk
+    return bytes(chunks)
+
+
+def emit(name, score, near=False):
+    payload = {"model": name, "score": round(float(score), 3)}
+    if near:
+        payload["near"] = True
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+# ------------------------------------------------------------------ sherpa
+
+def encode_keywords(phrases):
+    """Phrases are ordinary text. The model never saw them and does not need
+    to — they are turned into token sequences its decoder can be steered
+    towards, which is why the wake word can be changed by editing a string."""
+    raw = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+    raw.write("\n".join(p.strip().upper() for p in phrases if p.strip()) + "\n")
+    raw.close()
+    out = os.path.join(SHARE, "wake-keywords.txt")
+    cli = os.path.join(SHARE, "venv/bin/sherpa-onnx-cli")
+    result = subprocess.run(
+        [cli, "text2token", "--tokens", os.path.join(KWS_DIR, "tokens.txt"),
+         "--tokens-type", "bpe", "--bpe-model", os.path.join(KWS_DIR, "bpe.model"),
+         raw.name, out],
+        capture_output=True, text=True)
+    if result.returncode != 0 or not os.path.exists(out):
+        print(f"ERROR encoding keywords: {result.stderr.strip()[:200]}",
+              file=sys.stderr, flush=True)
+        return None
+    return out
+
+
+def run_sherpa():
+    import sherpa_onnx
+
+    phrases = [p for p in PHRASES.split(",") if p.strip()]
+    keywords = encode_keywords(phrases)
+    if not keywords:
+        return 1
+
+    def model(name):
+        return os.path.join(KWS_DIR, f"{name}-epoch-12-avg-2-chunk-16-left-64.int8.onnx")
+
+    spotter = sherpa_onnx.KeywordSpotter(
+        tokens=os.path.join(KWS_DIR, "tokens.txt"),
+        encoder=model("encoder"), decoder=model("decoder"), joiner=model("joiner"),
+        keywords_file=keywords,
+        num_threads=1,          # 40x realtime on one thread; leave the rest alone
+        provider="cpu",
+        keywords_score=KWS_SCORE,
+        keywords_threshold=KWS_THRESHOLD,
+        num_trailing_blanks=1,
+    )
+    print(f"READY sherpa {phrases}", file=sys.stderr, flush=True)
+
+    stream = spotter.create_stream()
+    cooldown = 0
+    source = sys.stdin.buffer
+    while True:
+        raw = read_exact(source, FRAME * 2)
+        if raw is None:
+            return 0
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        stream.accept_waveform(16000, samples)
+        while spotter.is_ready(stream):
+            spotter.decode_stream(stream)
+            hit = spotter.get_result(stream)
+            if hit:
+                spotter.reset_stream(stream)
+                if cooldown <= 0:
+                    emit(hit, 1.0)
+                    cooldown = COOLDOWN_FRAMES
+        if cooldown > 0:
+            cooldown -= 1
+
+
+# ----------------------------------------------------------- openwakeword
+
+class Personal:
+    def __init__(self, path):
+        self.ok = False
+        if not path or not os.path.exists(path):
+            return
+        try:
+            data = np.load(path, allow_pickle=True)
+            self.coef = data["coef"].astype(np.float32)
+            self.intercept = float(data["intercept"][0])
+            self.threshold = float(data["threshold"])
+            self.ok = True
+        except Exception as exc:
+            print(f"ERROR personal model: {exc}", file=sys.stderr, flush=True)
+
+    def score(self, features):
+        x = np.asarray(features, dtype=np.float32).reshape(-1)
+        if x.shape[0] != self.coef.shape[0]:
+            return 0.0
+        margin = float(np.dot(self.coef, x) + self.intercept) - self.threshold
+        return float(1.0 / (1.0 + np.exp(-margin)))
+
+
+def run_openwakeword():
+    from openwakeword.model import Model
+
+    base = os.path.join(os.path.dirname(__import__("openwakeword").__file__),
+                        "resources", "models")
+    paths = [p if os.path.isabs(p) else os.path.join(base, p)
+             for p in (m.strip() for m in MODELS.split(",")) if p]
+    paths = [p for p in paths if os.path.exists(p)]
+    if not paths:
+        print("ERROR no wake models found", file=sys.stderr, flush=True)
+        return 1
+
+    model = Model(wakeword_model_paths=paths)
+    personal = Personal(PERSONAL)
+    if personal.ok:
+        print("PERSONAL model loaded", file=sys.stderr, flush=True)
+    print("READY openwakeword", file=sys.stderr, flush=True)
+
+    cooldown = 0
+    source = sys.stdin.buffer
+    while True:
+        raw = read_exact(source, FRAME * 2)
+        if raw is None:
+            return 0
+        scores = dict(model.predict(np.frombuffer(raw, dtype=np.int16)))
+        if personal.ok:
+            try:
+                scores["personal"] = personal.score(model.preprocessor.get_features(16))
+            except Exception:
+                pass
+        if cooldown > 0:
+            cooldown -= 1
+            continue
+        name, best = "", 0.0
+        for key, value in scores.items():
+            if value > best:
+                name, best = key, float(value)
+        if best >= THRESHOLD:
+            emit(name, best)
+            cooldown = COOLDOWN_FRAMES
+            model.reset()
+        elif best >= REPORT:
+            emit(name, best, near=True)
+
+
+def main():
+    if ENGINE == "sherpa" and os.path.isdir(KWS_DIR):
+        try:
+            return run_sherpa()
+        except Exception as exc:
+            print(f"ERROR sherpa engine: {exc}; falling back", file=sys.stderr, flush=True)
+    return run_openwakeword()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "juno.assistant",
+  "name": "Jarvis",
+  "version": "1.0.0",
+  "author": "shreyanshsarthak10",
+  "license": "MIT",
+  "description": "A wake-word voice assistant. Say \"Hey Jarvis\" and Claude answers out loud, with a live view of everything it does.",
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Juno.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Jarvis",
+    "description": "Microphone state at a glance: idle, listening, thinking, speaking. Click to open Jarvis, right-click to wake without speaking.",
+    "category": "AI",
+    "aliases": [
+      "jarvis",
+      "juno",
+      "assistant",
+      "voice"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

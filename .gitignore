@@ -1,0 +1,18 @@
+# Voice recordings, conversation history, models, virtualenv — none of this
+# belongs in a repository. The recordings in particular are personal data.
+eval/
+enrollment/
+*.wav
+*.raw
+*.npz
+personal-wake.npz
+history.json
+venv/
+models/
+kokoro/
+voices/
+fw/
+kws/
+hf/
+libshim/
+__pycache__/

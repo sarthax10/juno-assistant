@@ -1,0 +1,17 @@
+[Unit]
+Description=Juno voice assistant
+Documentation=file:%h/.local/share/juno/README.md
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/juno/juno-daemon
+Restart=on-failure
+RestartSec=3
+# The daemon spawns claude, which mise puts on PATH.
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+Slice=app.slice
+
+[Install]
+WantedBy=graphical-session.target

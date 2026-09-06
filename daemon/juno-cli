@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""juno — talk to the Juno daemon from a shell, a keybinding, or QML."""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SOCKET = os.path.join(RUNTIME, "juno.sock")
+SHARE = os.path.expanduser("~/.local/share/juno")
+
+USAGE = """juno — voice assistant control
+
+  juno stream            subscribe to the event stream (newline JSON)
+  juno wake              wake Juno as if you had said the name
+  juno ask <text>        ask in text, no microphone
+  juno say <text>        speak a line in Juno's voice
+  juno enroll [takes]    train the wake word on your own voice
+  juno eval [secs]       measure accuracy on YOUR voice, not synthetic
+  juno miccheck [secs]   record yourself and score the wake word
+  juno threshold [n]     show or set the wake sensitivity
+  juno cancel            stop the current turn
+  juno mute / unmute     toggle the microphone
+  juno quiet / speak     toggle the spoken voice
+  juno clear             forget the conversation
+  juno status            one-shot health snapshot
+  juno start/stop/restart/logs    manage the background service
+"""
+
+
+def connect(timeout=2.0):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(SOCKET)
+    return s
+
+
+def send(payload, wait=False):
+    try:
+        s = connect()
+    except OSError:
+        sys.stderr.write("juno: daemon is not running (try: juno start)\n")
+        return 1
+    with s:
+        s.sendall((json.dumps(payload) + "\n").encode())
+        if wait:
+            s.settimeout(3.0)
+            buf = b""
+            try:
+                while b"\n" not in buf:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+            except socket.timeout:
+                pass
+            if buf:
+                print(buf.split(b"\n")[0].decode("utf-8", "replace"))
+        else:
+            time.sleep(0.1)
+    return 0
+
+
+def stream():
+    """Reconnects on its own so the QML overlay can outlive a daemon restart."""
+    while True:
+        try:
+            s = connect(timeout=None)
+        except OSError:
+            print(json.dumps({"t": "offline"}), flush=True)
+            time.sleep(1.5)
+            continue
+        try:
+            with s, s.makefile("rb") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        sys.stdout.write(line.decode("utf-8", "replace") + "\n")
+                        sys.stdout.flush()
+        except OSError:
+            pass
+        print(json.dumps({"t": "offline"}), flush=True)
+        time.sleep(1.0)
+
+
+def service(action):
+    unit = "juno.service"
+    if action == "logs":
+        os.execvp("journalctl", ["journalctl", "--user", "-u", unit, "-f", "-n", "80"])
+    subprocess.run(["systemctl", "--user", action, unit])
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cmd, rest = args[0], args[1:]
+
+    if cmd == "stream":
+        try:
+            stream()
+        except KeyboardInterrupt:
+            pass
+        return 0
+    if cmd in ("start", "stop", "restart", "status-unit", "logs", "enable", "disable"):
+        return service("status" if cmd == "status-unit" else cmd)
+    if cmd == "wake":
+        return send({"cmd": "wake"})
+    if cmd == "ask":
+        text = " ".join(rest).strip()
+        if not text:
+            sys.stderr.write("juno: nothing to ask\n")
+            return 2
+        return send({"cmd": "ask", "text": text})
+    if cmd == "say":
+        text = " ".join(rest).strip()
+        return send({"cmd": "say", "text": text}) if text else 2
+    if cmd == "levels":
+        return send({"cmd": "levels", "value": rest and rest[0] != "off"})
+    if cmd in ("eval", "benchmark"):
+        os.execv(os.path.expanduser("~/.local/share/juno/juno-eval"),
+                 ["juno-eval"] + rest)
+    if cmd in ("enroll", "train"):
+        os.execv(os.path.expanduser("~/.local/share/juno/juno-enroll"),
+                 ["juno-enroll"] + rest)
+    if cmd in ("miccheck", "testmic", "mictest"):
+        os.execv(os.path.expanduser("~/.local/share/juno/juno-miccheck"),
+                 ["juno-miccheck"] + rest)
+    if cmd == "threshold":
+        import json as _json
+        path = os.path.expanduser("~/.config/juno/config.json")
+        cfg = _json.load(open(path))
+        if not rest:
+            print(cfg.get("wakeThreshold", 0.35)); return 0
+        cfg["wakeThreshold"] = float(rest[0])
+        _json.dump(cfg, open(path, "w"), indent=2, ensure_ascii=False)
+        subprocess.run(["systemctl", "--user", "restart", "juno.service"])
+        print(f"wake threshold set to {cfg['wakeThreshold']}")
+        return 0
+    if cmd == "cancel":
+        return send({"cmd": "cancel"})
+    if cmd == "clear":
+        return send({"cmd": "clear"})
+    if cmd in ("mute", "unmute"):
+        return send({"cmd": "set", "key": "micMuted", "value": cmd == "mute"})
+    if cmd in ("quiet", "speak"):
+        return send({"cmd": "set", "key": "speak", "value": cmd == "speak"})
+    if cmd == "allow":
+        return send({"cmd": "retry_unguarded"})
+    if cmd == "status":
+        try:
+            sock = connect()
+        except OSError:
+            sys.stderr.write("juno: daemon is not running (try: juno start)\n")
+            return 1
+        with sock, sock.makefile("rb") as fh:
+            snap = json.loads(fh.readline().decode("utf-8", "replace"))
+        cfg, health = snap.get("config", {}), snap.get("health", {})
+        print(f"state         {snap.get('state')}")
+        # The two settings that silently make Juno useless go first.
+        print(f"microphone    {'MUTED — she cannot hear you' if cfg.get('micMuted') else 'live'}")
+        print(f"voice         {'off — she will not speak' if not cfg.get('speak') else 'on'}")
+        print(f"recognition   {health.get('model')}  (last language: {health.get('language')})")
+        print(f"speech        {health.get('voiceEngine')}")
+        print(f"claude        {'ready' if health.get('claude') else 'MISSING'}")
+        return 0
+
+    sys.stderr.write(f"juno: unknown command '{cmd}'\n{USAGE}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

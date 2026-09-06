@@ -1,0 +1,2075 @@
+#!/usr/bin/env python3
+"""
+Juno — the daemon half of the Omarchy voice assistant.
+
+Owns the microphone, the wake word, the speech models, and the Claude
+session. Publishes a newline-JSON event stream over a unix socket and
+accepts newline-JSON commands on the same socket. The QML overlay is a
+pure subscriber: it can crash, reload, or be closed entirely without the
+daemon losing the conversation or stopping listening for the wake word.
+
+Pipeline:
+
+    pw-record --raw ──► 20ms frames ──► energy VAD ──► utterance
+                             │                              │
+                        level events                   whisper-server
+                       (UI visualizer)                      │
+                                                     ┌──────┴──────┐
+                                            state=IDLE        state=LISTENING
+                                            fuzzy wake match   the command
+                                                     │              │
+                                                     └────► claude -p ──► TTS
+
+Silence costs nothing: the VAD is arithmetic on 320 samples, and whisper
+only ever sees audio that already passed it.
+"""
+
+import array
+import contextlib
+import difflib
+import errno
+import io
+import json
+import math
+import os
+import queue
+import re
+import shutil
+import signal
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+import wave
+
+HOME = os.path.expanduser("~")
+SHARE = os.path.join(HOME, ".local/share/juno")
+STATE = os.path.join(HOME, ".local/state/juno")
+CONFIG_PATH = os.path.join(HOME, ".config/juno/config.json")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SOCKET_PATH = os.path.join(RUNTIME, "juno.sock")
+HISTORY_PATH = os.path.join(STATE, "history.json")
+
+SAMPLE_RATE = 16000
+FRAME_MS = 20
+FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000      # 320
+FRAME_BYTES = FRAME_SAMPLES * 2
+
+log_lock = threading.Lock()
+
+
+def log(*parts):
+    line = f"[{time.strftime('%H:%M:%S')}] " + " ".join(str(p) for p in parts)
+    with log_lock:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
+# --------------------------------------------------------------------- config
+
+DEFAULTS = {
+    "wakeWord": "Jarvis",
+    # The dedicated wake model. Only these phrases exist as
+    # pretrained models: hey_jarvis, alexa, hey_mycroft, hey_marvin.
+    "wakeModel": "hey_jarvis_v0.1.onnx",
+    # "sherpa" decodes the phrase; "openwakeword" classifies the audio.
+    # Measured on this user: openWakeWord produced 87 false wakes an hour at
+    # the threshold needed to hear them at all, sherpa produced none.
+    "wakeEngine": "sherpa",
+    # Plain text, comma separated. No training — change the string and
+    # restart. Add "JUNO" here to answer to that name too.
+    "wakePhrases": "HEY JARVIS",
+    "wakeKwsScore": 4.0,
+    "wakeKwsThreshold": 0.01,
+    "wakeThreshold": 0.35,
+    "wakeCooldownSeconds": 1.5,
+    # Also match the wake word inside whisper transcripts. Redundant once the
+    # detector works, and it costs a transcription of every noise burst, so
+    # it is off. Turn it on to keep waking on the old spoken name too.
+    "transcriptWakeFallback": False,
+    # Whisper mangles short names in predictable ways. Accepting the
+    # mangles is cheaper than demanding the user enunciate.
+    #
+    # Two tiers, because position changes how much a match is worth. A
+    # distinctive mangle of "Juno" means Juno wherever it lands in a
+    # sentence. A loose homophone like "you know" is a real English phrase
+    # that people say constantly, so it only counts when the utterance
+    # opens with it.
+    # Measured, not guessed: these are the transcripts whisper actually
+    # produced for each phrase spoken into this microphone.
+    #   "Hey Juno"  -> "Hey Juneau"      (reliable — "hey" anchors the parse)
+    #   "Okay Juno" -> "Okay, Juneau"
+    #   "Juno"      -> "You know" / "Do you know"  (collapses into English)
+    "wakeAliases": ["juno", "hey juno", "ok juno", "okay juno",
+                    "juneau", "hey juneau", "ok juneau", "okay juneau",
+                    "junot", "jun oh", "yuno", "junos",
+                    # Devanagari. Whisper spells the name correctly once the
+                    # prompt has established it, but hedges on the vowels.
+                    "जूनो", "हे जूनो", "जुनो", "जूनू", "ज्यूनो", "यूनो",
+                    "ओके जूनो", "अरे जूनो"],
+    "wakeAliasesHead": ["you know", "do you know", "d you know", "uno",
+                        "junior", "hey uno", "do no", "hey you know",
+                        "you no", "dunno"],
+    "wakeFuzz": 0.82,
+    # Whisper's own confidence, used to throw away words it invented over
+    # music. Measured on this machine: real speech scores no_speech 0.001
+    # and logprob -0.55 to -0.93; music transcribed as Hindi scored 0.54
+    # and -1.24. Anything worse than these is not speech.
+    "maxNoSpeech": 0.35,
+    "minLogProb": -1.05,
+    # Multilingual by default. ggml-base.en.bin is roughly twice as fast
+    # but cannot hear anything except English.
+    "model": os.path.join(SHARE, "models/ggml-small.bin"),
+    # "auto" detects per utterance; "en" or "hi" pins it and is faster.
+    "whisperLanguage": "auto",
+    "whisperThreads": 8,
+    # base is the largest that answers in a usable time on this
+    # CPU. "small" is noticeably more accurate and several times
+    # slower; "tiny" translates Hindi instead of transcribing it.
+    "sttModel": "base",
+    # Hindi goes to a model fine-tuned on Hindi; English stays on the fast
+    # multilingual one. Set to "" to use one model for everything.
+    "sttModelHindi": "collabora/faster-whisper-small-hindi",
+    "sttHindiMinProb": 0.55,
+    "sttCompute": "int8",
+    # Used only for commands, never while waiting for the wake word.
+    #
+    # Empty means "the fast model is good enough", which on this user's own
+    # recordings it is: measured on eight real utterances, base scored 10%
+    # word error in 1.6s a clip and small scored 5% in 4.5s. Three times the
+    # wait for five points is the wrong trade for something you talk to.
+    # Earlier synthetic tests said the opposite; they were wrong, because
+    # text-to-speech is not a person.
+    "sttModelAccurate": "",
+    "whisperPort": 8642,
+    # Given as decoding context so whisper spells the name instead of
+    # hearing it as ordinary English.
+    "whisperPrompt": "Hey Juno. Juno, are you there? हे जूनो। जूनो, आप कैसे हैं?",
+    "voice": os.path.join(SHARE, "voices/en_US-amy-medium.onnx"),
+    # auto picks the best engine present: kokoro > piper > espeak.
+    "voiceEngine": "auto",
+    "kokoroVoice": "af_heart",
+    # Kokoro's Hindi voices are slow and unclear, so Juno understands
+    # Hindi and answers in English. Set true to hear Hindi spoken anyway.
+    "hindiVoice": False,
+    "kokoroVoiceHindi": "hf_alpha",
+    "kokoroSpeed": 1.0,
+    "speak": True,
+    "chime": True,
+    # How long Juno keeps the floor after answering, so you can follow up
+    # without saying the name again. In a room with a television in it, set
+    # this to 0: anything the microphone catches during the window is treated
+    # as addressed to Juno, including dialogue from a speaker.
+    "followUpSeconds": 6,
+    # How many turns in a row may skip the wake word before Juno insists on
+    # hearing her name again. 0 disables follow-ups entirely, which is the
+    # right setting in a room with a speaker in it.
+    "followUpMaxTurns": 2,
+    # Conversation memory resets after this much silence.
+    "sessionIdleSeconds": 900,
+    "workspace": os.path.join(HOME, "Juno"),
+    "autoMode": "scoped",          # scoped | full | ask
+    "vadStartRatio": 2.2,
+    "vadEndRatio": 1.35,
+    # Fraction of this utterance's own peak below which you are considered
+    # to have stopped. This was 0.5, which cut people off mid-sentence:
+    # connected speech dips well below half its own peak between words, so
+    # "can you set an alarm at 10 am" was ending at "can you set an" and
+    # whisper was left guessing at the fragment ("can you set an advance for
+    # two hours"). Lower means more patient.
+    "vadEndPeakRatio": 0.28,
+    "vadSilenceMs": 850,
+    "vadMinSpeechMs": 240,
+    "vadMaxUtteranceMs": 8000,
+    # Long enough for a whole sentence said in one breath. This was 4500,
+    # which truncated real requests: music opens the segment, you start
+    # speaking two seconds in, the cap fires mid-sentence, and whisper is
+    # handed half a request. "Juno, can you tell me the specifications of my
+    # device" alone takes 3.2 seconds to say. Junk is rejected by the
+    # confidence gate now, so the cap no longer has to do that job.
+    "vadMaxWakeMs": 9000,
+    "micMuted": False,
+    # Restart the capture if no audio arrives for this long.
+    "micStallSeconds": 12,
+    # The capture device, by name. "default" follows the system default and
+    # inherits its habit of wandering off. `pactl list short sources` lists
+    # the names.
+    "micSource": "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic1__source",
+    # Extra wait after the last sample, for whatever the speaker still holds.
+    "ttsDrainSeconds": 0.5,
+    # How long the microphone stays shut after Juno stops speaking, so the
+    # room's reverb does not come back as a command.
+    "micReopenDelay": 1.4,
+    # Backlog limits. Transcription is slower than a noisy room generates
+    # audio, so both of these have to be small.
+    "maxPendingSegments": 2,
+    "maxSegmentAgeSeconds": 8,
+    # 0 disables auto-hide; otherwise the overlay dismisses itself this
+    # many seconds after Juno goes quiet.
+    "autoHideSeconds": 25,
+    "autoShow": True,
+    "pluginId": "juno.assistant",
+    "systemPrompt": (
+        "You are Jarvis, a voice assistant on a Linux desktop. Everything you "
+        "write is spoken aloud by a synthetic voice, so write speech, not "
+        "prose.\n"
+        "\n"
+        "BE SHORT. This is the single most important rule. Your replies are "
+        "spoken aloud one word at a time, so every extra sentence is a real "
+        "delay the user sits through. One or two sentences. Twenty-five words "
+        "is a lot. If they asked a yes/no question, the first word is yes or "
+        "no. If they asked you to do something, do it and say one sentence "
+        "about what happened. Never recap what they asked. Never list what "
+        "you are about to do. Never offer follow-ups they did not ask for. "
+        "Only go longer when they explicitly ask you to explain something.\n"
+        "\n"
+        "SOUND LIKE A PERSON, NOT A DOCUMENT.\n"
+        "- Short sentences. No markdown, no bullet points, no headings, no "
+        "code blocks unless code was explicitly asked for. A list read aloud "
+        "is unbearable; say \"three things\" and then say them.\n"
+        "- Lead with the answer, then the detail if it is worth it.\n"
+        "- React before you answer when there is something to react to. A "
+        "real person says \"oh, that's not good\" before explaining the "
+        "error. Openers like Hmm, Oh, Ah, Right, Okay so, Yeah, Alright, "
+        "Well, Let's see are natural — use one when it fits the moment, and "
+        "no opener at all when it does not. Never open the same way twice in "
+        "a row.\n"
+        "- A hesitation is allowed where a person would actually hesitate — "
+        "before a guess, a caveat, or bad news. \"Umm, I think so, but let "
+        "me check.\" Not before a fact you are sure of, and not in every "
+        "reply. Sprinkled, not sprayed.\n"
+        "- Contractions always: it's, you've, that's, I'll, don't.\n"
+        "- Commas and ellipses become pauses in the voice, so punctuate for "
+        "breath rather than for grammar.\n"
+        "- Vary your sentence lengths. Uniform rhythm is what makes "
+        "synthetic speech sound synthetic.\n"
+        "- Never say \"I have completed the task\" or \"Certainly!\" or "
+        "\"I hope this helps.\" Say \"done\", \"got it\", \"yeah, "
+        "that worked\".\n"
+        "- If you ran a command or changed a file, say plainly what you did "
+        "in one sentence.\n"
+        "- Ambiguous request? Make the reasonable assumption, say which one "
+        "you made, and carry on. Don't interrogate.\n"
+        "\n"
+        "LANGUAGE. Always answer in English, no matter what language the "
+        "user speaks to you in. If they speak Hindi or Hinglish, understand "
+        "it perfectly and reply in natural English — do not translate their "
+        "words back at them, do not apologise for answering in English, and "
+        "do not mix Hindi into your reply. Keep proper nouns as they are."
+    ),
+}
+
+DESTRUCTIVE = [
+    (r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+", "recursive or forced delete"),
+    (r"\bsudo\b", "elevated privileges"),
+    (r"\bpkexec\b", "elevated privileges"),
+    (r"\bmkfs(\.\w+)?\b", "filesystem format"),
+    (r"\bdd\s+.*\bof=/dev/", "raw device write"),
+    (r">\s*/dev/(sd|nvme|mmcblk)", "raw device write"),
+    (r"\b(shutdown|reboot|poweroff|halt)\b", "power state change"),
+    (r"\bgit\s+push\b.*(--force|-f)\b", "force push"),
+    (r"\bgit\s+reset\s+--hard\b", "discards local work"),
+    (r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|k)?sh\b", "pipe-to-shell"),
+    (r":\(\)\s*\{.*\}\s*;?\s*:", "fork bomb"),
+    (r"\bchmod\s+(-R\s+)?777\s+/", "world-writable system path"),
+    (r"\buserdel\b|\bpasswd\b", "account modification"),
+    (r"\bpacman\s+-R", "package removal"),
+]
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_PATH) as fh:
+            user = json.load(fh)
+        if isinstance(user, dict):
+            cfg.update({k: v for k, v in user.items() if v is not None})
+    except FileNotFoundError:
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as fh:
+            json.dump(DEFAULTS, fh, indent=2)
+            fh.write("\n")
+    except Exception as exc:
+        log("config: ignoring bad file:", exc)
+    return cfg
+
+
+# ------------------------------------------------------------------ event bus
+
+class Bus:
+    """Fan-out to every connected UI. Slow clients get dropped frames, never
+    backpressure onto the audio thread."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.clients = []
+
+    def add(self, q):
+        with self.lock:
+            self.clients.append(q)
+
+    def remove(self, q):
+        with self.lock:
+            if q in self.clients:
+                self.clients.remove(q)
+
+    def count(self):
+        with self.lock:
+            return len(self.clients)
+
+    def emit(self, **event):
+        event.setdefault("ts", time.time())
+        payload = (json.dumps(event, ensure_ascii=False) + "\n").encode()
+        with self.lock:
+            targets = list(self.clients)
+        for q in targets:
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                pass
+
+
+BUS = Bus()
+
+
+# ---------------------------------------------------------------------- audio
+
+def wav_bytes(pcm, rate=SAMPLE_RATE):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def write_tone_wav(path, notes, rate=44100, volume=0.28):
+    """A chime with a soft attack and exponential tail — a click or a raw
+    sine both read as 'error' to the ear."""
+    frames = bytearray()
+    for freq, dur in notes:
+        n = int(rate * dur)
+        for i in range(n):
+            t = i / rate
+            env = min(1.0, t / 0.012) * math.exp(-t * 7.5)
+            s = math.sin(2 * math.pi * freq * t)
+            s += 0.28 * math.sin(4 * math.pi * freq * t)
+            frames += struct.pack("<h", int(max(-1, min(1, s * env * volume)) * 32767))
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+
+
+def ensure_sounds():
+    sounds = os.path.join(SHARE, "sounds")
+    os.makedirs(sounds, exist_ok=True)
+    specs = {
+        # rising = "I'm listening", falling = "I'm done", low = "something broke"
+        "wake.wav": [(659.25, 0.09), (987.77, 0.20)],
+        "done.wav": [(987.77, 0.07), (659.25, 0.16)],
+        "error.wav": [(311.13, 0.10), (233.08, 0.20)],
+    }
+    for name, notes in specs.items():
+        path = os.path.join(sounds, name)
+        if not os.path.exists(path):
+            try:
+                write_tone_wav(path, notes)
+            except Exception as exc:
+                log("sounds:", exc)
+    return sounds
+
+
+def rms_of(frame):
+    samples = array.array("h")
+    samples.frombytes(frame)
+    if not samples:
+        return 0.0
+    total = 0
+    for s in samples:
+        total += s * s
+    return math.sqrt(total / len(samples)) / 32768.0
+
+
+class WakeWord:
+    """A dedicated wake-word model, fed the microphone directly.
+
+    Matching a name inside a whisper transcript was the wrong architecture:
+    whisper is asked to write down everything anyone in the room said, and
+    the name then has to survive that. Measured here, playing the wake phrase
+    through the speakers, it did not — three attempts, three misses, one of
+    them transcribed "I know your post is amazing".
+
+    This model answers one question instead, in eight milliseconds, and was
+    trained on noise. Same room, same speakers, same three attempts: 0.992,
+    0.997, 0.998.
+    """
+
+    def __init__(self, cfg, on_detect):
+        self.cfg = cfg
+        self.on_detect = on_detect
+        self.path = os.path.join(SHARE, "juno-wake")
+        self.proc = None
+        self.ready = False
+        # Bounded: if the detector ever falls behind, drop frames rather than
+        # block the thread that owns the microphone.
+        self.frames = queue.Queue(maxsize=64)
+        self.dropped = 0
+        self.paused = False
+
+    def available(self):
+        return os.path.exists(self.path) and self.cfg.get("wakeModel")
+
+    def env(self):
+        env = dict(os.environ)
+        env["JUNO_WAKE_MODELS"] = str(self.cfg.get("wakeModel", ""))
+        env["JUNO_WAKE_ENGINE"] = str(self.cfg.get("wakeEngine", "sherpa"))
+        env["JUNO_WAKE_PHRASES"] = str(self.cfg.get("wakePhrases", "HEY JARVIS"))
+        env["JUNO_KWS_SCORE"] = str(self.cfg.get("wakeKwsScore", 4.0))
+        env["JUNO_KWS_THRESHOLD"] = str(self.cfg.get("wakeKwsThreshold", 0.01))
+        env["JUNO_WAKE_THRESHOLD"] = str(self.cfg.get("wakeThreshold", 0.5))
+        env["JUNO_WAKE_COOLDOWN"] = str(self.cfg.get("wakeCooldownSeconds", 1.5))
+        return env
+
+    def start(self):
+        if not self.available():
+            log("wake: detector unavailable; falling back to transcript matching")
+            return False
+        try:
+            self.proc = subprocess.Popen(
+                [self.path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=0, env=self.env())
+        except Exception as exc:
+            log("wake: could not start detector:", exc)
+            return False
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                log("wake: detector exited during startup")
+                return False
+            line = self.proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "replace").strip()
+            # The worker names its engine on the ready line, so match the
+            # prefix. An exact comparison here hung startup completely: the
+            # daemon sat reading stderr for a word that never came.
+            if text.startswith("READY"):
+                self.ready = True
+                log(f"wake: listening for {self.cfg.get('wakeWord')} "
+                    f"({self.cfg.get('wakeModel')})")
+                threading.Thread(target=self.feed, daemon=True).start()
+                threading.Thread(target=self.listen, daemon=True).start()
+                return True
+            log("wake:", text[:140])
+        log("wake: detector never signalled ready")
+        return False
+
+    def push(self, frame):
+        # Nothing to detect once she is already awake, and the transcriber
+        # needs every cycle this machine has.
+        if not self.ready or self.paused:
+            return
+        try:
+            self.frames.put_nowait(frame)
+        except queue.Full:
+            # A dropped frame is a hole in the middle of a phrase, and the
+            # model sees a different phrase. Worth knowing about.
+            self.dropped += 1
+            if self.dropped % 50 == 1:
+                log(f"wake: dropped {self.dropped} frames — detector is behind")
+
+    def feed(self):
+        while self.proc and self.proc.poll() is None:
+            try:
+                frame = self.frames.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self.proc.stdin.write(frame)
+            except Exception:
+                return
+
+    def listen(self):
+        while self.proc and self.proc.poll() is None:
+            line = self.proc.stdout.readline()
+            if not line:
+                return
+            try:
+                event = json.loads(line.decode("utf-8", "replace"))
+            except Exception:
+                continue
+            if event.get("near"):
+                log(f"wake: near miss ({event.get('score', 0):.2f}) — "
+                    f"threshold is {self.cfg.get('wakeThreshold', 0.35)}")
+                BUS.emit(t="wake_near", score=event.get("score", 0.0))
+                continue
+            self.on_detect(event.get("score", 0.0))
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self.proc.terminate()
+
+
+class Microphone(threading.Thread):
+    """Reads raw PCM forever, runs the VAD, and hands finished utterances to
+    the brain. Also publishes a smoothed level for the orb."""
+
+    daemon = True
+
+    def __init__(self, cfg, on_utterance, gate, wants_levels, listening=None,
+                 on_frame=None):
+        super().__init__(name="mic")
+        self.cfg = cfg
+        self.on_utterance = on_utterance
+        self.gate = gate                 # callable -> bool, False = discard audio
+        self.wants_levels = wants_levels # callable -> bool, drives the orb
+        self.listening = listening or (lambda: False)
+        self.on_frame = on_frame or (lambda frame: None)
+        self.proc = None
+        self.stop_flag = threading.Event()
+        self.noise_floor = 0.004
+        self.level = 0.0
+        self.speaking = False
+        self.preroll = []
+        self.buffer = bytearray()
+        self.silence_ms = 0
+        self.speech_ms = 0
+        self.peak = 0.0
+        self.tick = 0
+        self.last_frame_at = time.time()
+        self.frames_seen = 0
+
+    def stop(self):
+        self.stop_flag.set()
+        if self.proc and self.proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self.proc.terminate()
+
+    def spawn(self):
+        cmd = ["pw-record", "--raw", "--rate", str(SAMPLE_RATE),
+               "--channels", "1", "--format", "s16", "--latency", "20ms"]
+        # Capture from a named device rather than "whatever is default".
+        # The default input has silently moved to the headset jack three
+        # times in this session — once from a script of mine, twice on its
+        # own — and with nothing plugged in that jack is near-silent, so Juno
+        # went deaf while every status light stayed green.
+        source = self.cfg.get("micSource") or ""
+        if source and source != "default":
+            cmd += ["--target", source]
+        cmd += ["-"]
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, bufsize=0)
+
+    def run(self):
+        while not self.stop_flag.is_set():
+            try:
+                self.proc = self.spawn()
+            except FileNotFoundError:
+                log("mic: pw-record not found")
+                BUS.emit(t="error", message="pw-record is missing; PipeWire is required.")
+                return
+            log("mic: capture started")
+            self.last_frame_at = time.time()
+            threading.Thread(target=self.watchdog, args=(self.proc,),
+                             daemon=True).start()
+            try:
+                self.pump()
+            except Exception as exc:
+                log("mic: pump died:", exc)
+            if self.stop_flag.is_set():
+                return
+            log("mic: capture ended, restarting in 1s")
+            time.sleep(1.0)
+
+    def watchdog(self, proc):
+        """A capture that stops delivering does not raise anything — the read
+        just never returns, and Juno goes deaf in total silence. This happened:
+        PipeWire left the microphone node SUSPENDED with the stream still
+        attached, and the daemon sat there for twenty minutes reporting
+        "capture started" and hearing nothing. Killing the reader makes the
+        outer loop respawn it, which reattaches to a live node.
+        """
+        stall = float(self.cfg.get("micStallSeconds", 12))
+        while not self.stop_flag.is_set() and proc.poll() is None:
+            time.sleep(2)
+            if time.time() - self.last_frame_at < stall:
+                continue
+            log(f"mic: no audio for {stall:.0f}s — restarting capture")
+            BUS.emit(t="mic_stalled")
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            return
+
+    def pump(self):
+        out = self.proc.stdout
+        while not self.stop_flag.is_set():
+            frame = self.read_exact(out, FRAME_BYTES)
+            if frame is None:
+                return
+            self.consume(frame)
+
+    @staticmethod
+    def read_exact(stream, size):
+        """A pipe hands back whatever is ready, which is routinely less than a
+        full frame. Treating a short read as end-of-stream is how you get a
+        capture loop that restarts forever."""
+        chunks = bytearray()
+        while len(chunks) < size:
+            chunk = stream.read(size - len(chunks))
+            if not chunk:
+                return None
+            chunks += chunk
+        return bytes(chunks)
+
+    def consume(self, frame):
+        self.last_frame_at = time.time()
+        # The wake detector sees the raw stream, ahead of the mute gate and
+        # the VAD, because it does its own noise handling and needs
+        # continuity to recognise a phrase.
+        if not self.cfg.get("micMuted"):
+            self.on_frame(frame)
+        raw = rms_of(frame)
+        # Attack fast, release slow: the orb should snap to your voice and
+        # settle gently, not flicker.
+        self.level = max(raw, self.level * 0.82)
+        self.tick += 1
+        # Twenty-five events a second is nothing to produce and a great deal
+        # to parse. The overlay stays subscribed for the whole session, so
+        # publishing levels unconditionally meant the shell burned a fifth of
+        # a core redrawing an orb nobody was looking at.
+        if self.tick % 2 == 0 and BUS.count() and self.wants_levels():
+            headroom = max(self.noise_floor * 1.6, 0.015)
+            excess = (self.level - self.noise_floor) / headroom
+            BUS.emit(t="level", rms=round(max(0.0, min(1.0, excess)), 4))
+
+        if not self.gate():
+            self.reset_segment()
+            return
+
+        # A minimum-follower, run unconditionally. Gating it on "not speaking"
+        # is a trap: if the floor ever starts below the room, the gate latches
+        # open, `speaking` never clears, and the floor can never catch up.
+        # Falling fast and rising slowly keeps it pinned to the quiet parts
+        # whether or not anyone is talking.
+        if self.frames_seen < 3:
+            self.noise_floor = raw          # seed from the actual room
+        elif raw < self.noise_floor:
+            self.noise_floor += (raw - self.noise_floor) * 0.25
+        else:
+            self.noise_floor += (raw - self.noise_floor) * 0.0016
+        self.noise_floor = max(0.0005, min(0.45, self.noise_floor))
+        self.frames_seen += 1
+
+        # Give the follower a moment to settle before trusting the gate.
+        if self.frames_seen < 40:
+            return
+
+        start_gate = self.noise_floor * self.cfg["vadStartRatio"] + 0.004
+        end_gate = self.noise_floor * self.cfg["vadEndRatio"] + 0.002
+
+        if not self.speaking:
+            self.preroll.append(frame)
+            if len(self.preroll) > 15:            # 300ms of lead-in
+                self.preroll.pop(0)
+            if raw > start_gate:
+                self.speaking = True
+                self.buffer = bytearray(b"".join(self.preroll))
+                self.preroll = []
+                self.silence_ms = 0
+                self.speech_ms = 0
+                self.peak = raw
+                BUS.emit(t="vad", speaking=True)
+            return
+
+        self.buffer += frame
+        self.peak = max(self.peak, raw)
+
+        # Endpointing relative to the speaker, not to the room.
+        #
+        # A gate derived only from the noise floor cannot close while music
+        # is playing: the floor sits below the music, the music sits above
+        # the gate, and the utterance runs until the length cap — which is
+        # exactly "it never stops listening". Your voice is louder at the
+        # microphone than anything coming out of the speakers, so the honest
+        # signal that you stopped is the level falling well below your own
+        # loudest moment, whatever the room is doing underneath.
+        speaker_gate = self.peak * float(self.cfg["vadEndPeakRatio"])
+
+        # Two different questions, two different gates. Whether this frame
+        # contains voice at all decides if the utterance is long enough to
+        # bother transcribing; whether it is still near your own peak decides
+        # if you have stopped talking. Using the peak gate for both was a bug:
+        # ordinary speech spends most of its time below half its own peak, so
+        # the utterance never accumulated enough "speech" and every segment
+        # was thrown away as too short.
+        if raw > end_gate:
+            self.speech_ms += FRAME_MS
+        if raw > max(end_gate, speaker_gate):
+            self.silence_ms = 0
+        else:
+            self.silence_ms += FRAME_MS
+
+        cap = (self.cfg["vadMaxUtteranceMs"] if self.listening()
+               else self.cfg["vadMaxWakeMs"])
+        too_long = len(self.buffer) / (SAMPLE_RATE * 2) * 1000 >= cap
+        if self.silence_ms >= self.cfg["vadSilenceMs"] or too_long:
+            pcm = bytes(self.buffer)
+            enough = self.speech_ms >= self.cfg["vadMinSpeechMs"]
+            self.reset_segment()
+            BUS.emit(t="vad", speaking=False)
+            if enough:
+                self.on_utterance(pcm)
+
+    def reset_segment(self):
+        self.speaking = False
+        self.buffer = bytearray()
+        self.preroll = []
+        self.silence_ms = 0
+        self.speech_ms = 0
+        self.peak = 0.0
+
+
+# -------------------------------------------------------------------- whisper
+
+def whisper_env():
+    """Arch's whisper-cpp is linked against libbluray.so.4 while the repos
+    still ship soname 3. whisper never calls into it — it arrives as a
+    transitive ffmpeg dependency for Blu-ray demuxing, which a WAV file never
+    touches — so a private shim directory on LD_LIBRARY_PATH gets the binary
+    loading without putting a fake soname in /usr/lib. The moment a real
+    libbluray.so.4 exists, this stops being used.
+
+    The proper fix is a full `sudo pacman -Syu`.
+    """
+    env = dict(os.environ)
+    if any(os.path.exists(os.path.join(d, "libbluray.so.4"))
+           for d in ("/usr/lib", "/usr/lib64", "/lib")):
+        return env
+    shim = os.path.join(SHARE, "libshim")
+    if not os.path.isdir(shim):
+        return env
+    existing = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = shim + (":" + existing if existing else "")
+    return env
+
+
+class Whisper:
+    """Speech recognition through a resident CTranslate2 worker.
+
+    whisper.cpp was the first implementation and is still installed, but it
+    needed thirty to a hundred seconds for a two-second Hindi clip on this
+    machine: Devanagari tokenizes into far more tokens than Latin, whisper
+    decodes one token at a time, and this CPU runs at 1.2 GHz. The same
+    model under CTranslate2 int8 answers in about five, and detects the
+    language per utterance so English and Hindi need no mode switch.
+
+    The worker holds the model in memory. Starting it costs four seconds
+    once, which is four seconds nobody waits for mid-conversation.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.worker_path = os.path.join(SHARE, "juno-stt")
+        self.proc = None
+        self.lock = threading.Lock()
+        self.ready = False
+        self.last_language = ""
+        self.last_no_speech = 0.0
+        self.last_logprob = 0.0
+        # Kept only as a fallback if the worker will not start.
+        self.cli = (shutil.which("whisper-cli") or shutil.which("whisper"))
+
+    def available(self):
+        return os.path.exists(self.worker_path) or bool(self.cli)
+
+    def env(self):
+        env = dict(os.environ)
+        env["JUNO_STT_MODEL"] = str(self.cfg.get("sttModel", "base"))
+        env["JUNO_STT_COMPUTE"] = str(self.cfg.get("sttCompute", "int8"))
+        env["JUNO_STT_THREADS"] = str(self.cfg.get("whisperThreads", 6))
+        env["JUNO_STT_LANGUAGE"] = str(self.cfg.get("whisperLanguage", "auto"))
+        env["JUNO_STT_PROMPT"] = str(self.cfg.get("whisperPrompt", ""))
+        env["JUNO_STT_MODEL_HI"] = str(self.cfg.get("sttModelHindi", ""))
+        env["JUNO_STT_MODEL_ACCURATE"] = str(self.cfg.get("sttModelAccurate", ""))
+        env["JUNO_STT_HI_PROB"] = str(self.cfg.get("sttHindiMinProb", 0.55))
+        return env
+
+    def start(self):
+        if not os.path.exists(self.worker_path):
+            log("stt: worker missing; falling back to the whisper-cli path")
+            self.ready = bool(self.cli)
+            return self.ready
+        try:
+            self.proc = subprocess.Popen(
+                [self.worker_path], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1, env=self.env())
+        except Exception as exc:
+            log("stt: worker failed to launch:", exc)
+            self.ready = bool(self.cli)
+            return self.ready
+
+        # The model download on first run can take a while; wait generously.
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                log("stt: worker exited during startup")
+                self.ready = bool(self.cli)
+                return self.ready
+            line = self.proc.stderr.readline()
+            if not line:
+                break
+            if line.strip() == "READY":
+                self.ready = True
+                log(f"stt: {self.cfg.get('sttModel', 'base')} model resident "
+                    f"({self.cfg.get('sttCompute', 'int8')}, "
+                    f"{self.cfg.get('whisperThreads', 6)} threads)")
+                threading.Thread(target=self.drain_errors, daemon=True).start()
+                return True
+            log("stt:", line.strip()[:160])
+        log("stt: worker never signalled ready")
+        self.ready = bool(self.cli)
+        return self.ready
+
+    def drain_errors(self):
+        """Keep stderr moving so the worker never blocks on a full pipe."""
+        while self.proc and self.proc.poll() is None:
+            line = self.proc.stderr.readline()
+            if not line:
+                return
+            text = line.strip()
+            if text and text != "READY":
+                log("stt:", text[:160])
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+
+    def transcribe(self, pcm, accurate=False):
+        """`accurate` escalates to the Hindi model when the audio is Hindi.
+        Waiting for the wake word does not need it — only the name has to be
+        legible — so the expensive pass is reserved for actual commands."""
+        if not self.ready:
+            return ""
+        if self.proc and self.proc.poll() is None:
+            text = self.via_worker(pcm, accurate)
+            if text is not None:
+                return text
+        return self.via_cli(pcm)
+
+    def via_worker(self, pcm, accurate=False):
+        tmp = os.path.join(RUNTIME, f"juno-{uuid.uuid4().hex}.wav")
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(wav_bytes(pcm))
+            with self.lock:
+                self.proc.stdin.write(tmp + ("\tfull" if accurate else "") + "\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline()
+            if not line:
+                return None
+            data = json.loads(line)
+            if data.get("error"):
+                log("stt:", data["error"][:160])
+            self.last_language = data.get("language") or ""
+            self.last_no_speech = float(data.get("no_speech", 1.0))
+            self.last_logprob = float(data.get("logprob", -10.0))
+            return clean_transcript(data.get("text", ""))
+        except Exception as exc:
+            log("stt: worker request failed:", exc)
+            return None
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
+    def via_cli(self, pcm):
+        if not self.cli:
+            return ""
+        tmp = os.path.join(RUNTIME, f"juno-{uuid.uuid4().hex}.wav")
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(wav_bytes(pcm))
+            out = subprocess.run(
+                [self.cli, "-m", self.cfg["model"], "-t",
+                 str(self.cfg["whisperThreads"]), "-nt",
+                 "-l", str(self.cfg.get("whisperLanguage") or "auto"),
+                 "--prompt", self.cfg.get("whisperPrompt") or "",
+                 "-f", tmp],
+                capture_output=True, text=True, timeout=180, env=whisper_env())
+            return clean_transcript(out.stdout)
+        except Exception as exc:
+            log("stt: cli failed:", exc)
+            return ""
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+
+
+NOISE_TOKENS = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+
+
+def clean_transcript(text):
+    text = NOISE_TOKENS.sub(" ", str(text or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    # Whisper loves to hallucinate this on silence.
+    if text.lower().strip(" .!") in ("thank you", "thanks for watching",
+                                     "you", "bye", "so", "okay"):
+        return ""
+    return text
+
+
+# ------------------------------------------------------------------ wake word
+
+DEVANAGARI = re.compile(r"[\u0900-\u097f]")
+
+
+def script_language(text):
+    """Which language a piece of text is in, decided by the script it is
+    written in. Whisper emits Devanagari for Hindi and Latin for English, so
+    the answer is already in the transcript — no second classifier, no
+    guessing from word lists, and it works on a single word."""
+    return "hi" if DEVANAGARI.search(str(text or "")) else "en"
+
+
+def normalize(text):
+    # Devanagari has to survive this, or every Hindi wake word is erased
+    # before the matcher ever sees it.
+    return re.sub(r"[^a-z0-9 \u0900-\u097f]", " ", str(text).lower()).strip()
+
+
+def wake_split(text, cfg):
+    """Find the wake word and return (matched, whatever followed it).
+
+    The remainder matters: "Juno, what's the weather" should answer the
+    question rather than make you say it twice.
+
+    Position is part of the evidence. A strong alias counts anywhere in the
+    utterance, because a room with a television in it produces long segments
+    where the wake word lands in the middle of someone else's sentence. A
+    weak alias — "you know", "uno" — is ordinary English and only counts
+    when the utterance opens with it.
+    """
+    words = normalize(text).split()
+    if not words:
+        return False, ""
+
+    fuzz = float(cfg["wakeFuzz"])
+    strong = [normalize(a) for a in cfg.get("wakeAliases") or [] if a]
+    weak = [normalize(a) for a in cfg.get("wakeAliasesHead") or [] if a]
+
+    def hit(candidate, alias, threshold):
+        return (candidate == alias
+                or difflib.SequenceMatcher(None, candidate, alias).ratio() >= threshold)
+
+    def remainder_from(index):
+        rest = words[index:]
+        # A long tail is the room talking, not a command. Wake up and listen
+        # properly instead of acting on the television.
+        return " ".join(rest) if 0 < len(rest) <= 12 else ""
+
+    # Weak aliases: opening words only. Three words matter — whisper renders
+    # a bare "Juno" as "Do you know", which is three tokens, not one.
+    for span in (3, 2, 1):
+        if len(words) < span:
+            continue
+        head = " ".join(words[:span])
+        for alias in weak:
+            if len(alias.split()) == span and hit(head, alias, fuzz):
+                return True, remainder_from(span)
+
+    # Strong aliases: anywhere. Scan left to right so the earliest wake wins
+    # and the command is everything after it.
+    for start in range(len(words)):
+        for span in (3, 2, 1):
+            if start + span > len(words):
+                continue
+            candidate = " ".join(words[start:start + span])
+            for alias in strong:
+                if len(alias.split()) != span:
+                    continue
+                # Mid-sentence matches carry less context, so ask for more
+                # confidence there than at the very start of an utterance.
+                threshold = fuzz if start == 0 else max(fuzz, 0.88)
+                if hit(candidate, alias, threshold):
+                    return True, remainder_from(start + span)
+    return False, ""
+
+
+# ------------------------------------------------------------------------ TTS
+
+class Voice:
+    """A resident text-to-speech engine feeding a resident speaker.
+
+    Whichever engine is in use, the contract is the same: a line of text on
+    stdin, raw mono s16 PCM on stdout. Keeping the process up matters — the
+    models take seconds to load, and paying that between a question and its
+    answer would be the most noticeable thing about Juno.
+
+    Kokoro is preferred: it is a neural voice and sounds like a person.
+    It also runs at roughly real time, so it reports exact sample counts on
+    stderr rather than making the daemon guess when a sentence has ended.
+    Piper is faster and flatter, and stands in when Kokoro is unavailable;
+    espeak is the last resort and sounds like 1998.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+
+        self.kokoro_worker = os.path.join(SHARE, "juno-kokoro")
+        self.kokoro_model = os.path.join(SHARE, "kokoro/kokoro-v1.0.onnx")
+        self.kokoro_voices = os.path.join(SHARE, "kokoro/voices-v1.0.bin")
+
+        venv_piper = os.path.join(SHARE, "venv/bin/piper")
+        self.piper = venv_piper if os.path.exists(venv_piper) else (
+            shutil.which("piper-tts") or shutil.which("piper"))
+        # Arch's `piper` in [extra] is a mouse configurator, not a synthesizer.
+        if self.piper and self.piper != venv_piper and not self.looks_like_tts(self.piper):
+            self.piper = None
+
+        self.engine = self.choose_engine()
+        self.rate = 24000 if self.engine == "kokoro" else self.piper_rate()
+
+        self.lock = threading.Lock()
+        self.proc = None            # the synthesizer
+        self.sink = None            # pw-play
+        self.stopped = threading.Event()
+        self.done = threading.Event()
+        self.done_samples = 0
+        self.bytes_out = 0
+        self.last_byte_at = 0.0
+        self.first_byte_at = 0.0
+        self.discard = False
+
+    # ------------------------------------------------------------ discovery
+
+    def kokoro_ready(self):
+        return all(os.path.exists(p) for p in
+                   (self.kokoro_worker, self.kokoro_model, self.kokoro_voices))
+
+    def choose_engine(self):
+        want = str(self.cfg.get("voiceEngine", "auto")).lower()
+        if want == "kokoro" and self.kokoro_ready():
+            return "kokoro"
+        if want == "piper" and self.piper:
+            return "piper"
+        if want == "espeak" and self.espeak:
+            return "espeak"
+        if self.kokoro_ready():
+            return "kokoro"
+        if self.piper and os.path.exists(self.cfg["voice"]):
+            return "piper"
+        return "espeak" if self.espeak else "none"
+
+    @staticmethod
+    def looks_like_tts(path):
+        try:
+            out = subprocess.run([path, "--help"], capture_output=True,
+                                 text=True, timeout=6)
+            blob = (out.stdout + out.stderr).lower()
+            return "onnx" in blob or "espeak" in blob or "model" in blob
+        except Exception:
+            return False
+
+    def piper_rate(self):
+        try:
+            with open(self.cfg["voice"] + ".json") as fh:
+                return int(json.load(fh)["audio"]["sample_rate"])
+        except Exception:
+            return 22050
+
+    def available(self):
+        return self.engine != "none"
+
+    # ------------------------------------------------------------ the engine
+
+    def worker_command(self):
+        if self.engine == "kokoro":
+            return [self.kokoro_worker], self.kokoro_env()
+        if self.engine == "piper":
+            return [self.piper, "-m", self.cfg["voice"], "--output-raw"], None
+        return None, None
+
+    def kokoro_env(self):
+        env = dict(os.environ)
+        env["JUNO_KOKORO_MODEL"] = self.kokoro_model
+        env["JUNO_KOKORO_VOICES"] = self.kokoro_voices
+        env["JUNO_KOKORO_VOICE"] = str(self.cfg.get("kokoroVoice", "af_heart"))
+        env["JUNO_KOKORO_VOICE_HI"] = str(self.cfg.get("kokoroVoiceHindi", "hf_alpha"))
+        env["JUNO_KOKORO_SPEED_HI"] = str(self.cfg.get("kokoroSpeedHindi", 0.88))
+        env["JUNO_KOKORO_HINDI"] = "1" if self.cfg.get("hindiVoice") else "0"
+        env["JUNO_KOKORO_SPEED"] = str(self.cfg.get("kokoroSpeed", 1.0))
+        return env
+
+    def spawn_sink(self):
+        return subprocess.Popen(
+            ["pw-play", "--rate", str(self.rate), "--channels", "1",
+             "--format", "s16", "--raw", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, bufsize=0)
+
+    def ensure(self):
+        if self.engine in ("espeak", "none"):
+            return False
+        if self.proc and self.proc.poll() is None and \
+           self.sink and self.sink.poll() is None:
+            return True
+        self.teardown()
+        command, env = self.worker_command()
+        if not command:
+            return False
+        try:
+            self.proc = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=0, env=env)
+            self.sink = self.spawn_sink()
+        except Exception as exc:
+            log("tts: could not start engine:", exc)
+            self.teardown()
+            return False
+        self.stopped.clear()
+        threading.Thread(target=self.pump_audio, name="tts-audio",
+                         daemon=True).start()
+        threading.Thread(target=self.pump_control, name="tts-control",
+                         daemon=True).start()
+        log(f"tts: {self.engine} engine warm at {self.rate} Hz")
+        return True
+
+    def pump_audio(self):
+        proc, sink = self.proc, self.sink
+        while not self.stopped.is_set():
+            try:
+                chunk = proc.stdout.read(4096)
+            except Exception:
+                return
+            if not chunk:
+                return
+            self.bytes_out += len(chunk)
+            self.last_byte_at = time.time()
+            if not self.first_byte_at:
+                self.first_byte_at = time.time()
+            if self.discard:
+                continue
+            try:
+                sink.stdin.write(chunk)
+                sink.stdin.flush()
+            except Exception:
+                return
+
+    def pump_control(self):
+        """Kokoro reports exactly when a line is finished and how many samples
+        it produced. Piper says nothing, and speak() falls back to watching
+        for a pause in the audio."""
+        proc = self.proc
+        while not self.stopped.is_set():
+            try:
+                line = proc.stderr.readline()
+            except Exception:
+                return
+            if not line:
+                return
+            text = line.decode("utf-8", "replace").strip()
+            if text.startswith("DONE "):
+                with contextlib.suppress(ValueError):
+                    self.done_samples = int(text.split()[1])
+                self.done.set()
+            elif text.startswith("ERROR "):
+                log("tts:", text)
+
+    def teardown(self):
+        self.stopped.set()
+        for proc in (self.proc, self.sink):
+            if proc and proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+        self.proc = self.sink = None
+
+    def stop(self):
+        """Barge-in: drop the audio still in flight without reloading the
+        model. Only the speaker is replaced."""
+        with self.lock:
+            if not self.sink:
+                return
+            self.discard = True
+            self.done.set()
+            if self.sink.poll() is None:
+                with contextlib.suppress(Exception):
+                    self.sink.kill()
+            try:
+                self.sink = self.spawn_sink()
+            except Exception:
+                self.teardown()
+
+    # --------------------------------------------------------------- speak
+
+    def speak(self, text):
+        """Blocking: returns once the last sample has actually been heard, so
+        the caller knows when reopening the microphone is safe."""
+        text = tts_clean(text)
+        if not text or not self.cfg.get("speak", True):
+            return
+        if self.engine in ("kokoro", "piper") and self.speak_worker(text):
+            return
+        self.speak_espeak(text)
+
+    def speak_worker(self, text):
+        with self.lock:
+            if not self.ensure():
+                return False
+            self.discard = False
+            self.done.clear()
+            self.done_samples = 0
+            self.bytes_out = 0
+            self.last_byte_at = 0.0
+            self.first_byte_at = 0.0
+            proc = self.proc
+            try:
+                # One line is one utterance, so newlines become sentences.
+                proc.stdin.write((text.replace("\n", ". ") + "\n").encode())
+                proc.stdin.flush()
+            except Exception as exc:
+                log("tts: write failed:", exc)
+                self.teardown()
+                return False
+
+        started = time.time()
+        if self.engine == "kokoro":
+            # Exact: wait for the worker to say the line is fully synthesized.
+            if not self.done.wait(timeout=180):
+                log("tts: kokoro timed out")
+                return self.bytes_out > 0
+            samples = self.done_samples or (self.bytes_out // 2)
+        else:
+            # Piper is silent about progress, so watch for a pause in output.
+            while time.time() - started < 90:
+                time.sleep(0.08)
+                if self.discard:
+                    return True
+                if self.last_byte_at and time.time() - self.last_byte_at > 0.35:
+                    break
+                if self.proc is None or self.proc.poll() is not None:
+                    return False
+            samples = self.bytes_out // 2
+        if not samples:
+            return False
+
+        duration = samples / self.rate
+        log(f"tts: {duration:.2f}s audio, synth took {time.time() - started:.2f}s")
+
+        # When playback ends is a fact, not an estimate: it began at the
+        # first byte handed to the speaker and runs for the length of the
+        # audio. The previous version measured from when synthesis started,
+        # so whenever synthesis ran slower than real time — which it does on
+        # this machine — it concluded playback was already over and reopened
+        # the microphone into Juno's own voice. She then transcribed herself
+        # and answered it.
+        origin = self.first_byte_at or started
+        deadline = origin + duration + float(self.cfg.get("ttsDrainSeconds", 0.5))
+        while time.time() < deadline:
+            if self.discard:
+                break
+            time.sleep(0.05)
+        return True
+
+    def speak_espeak(self, text):
+        if not self.espeak:
+            return
+        cmd = (f'{shell_quote(self.espeak)} -v en-us+f3 -s 165 -p 42 --stdout '
+               f'2>/dev/null | pw-play -')
+        try:
+            proc = subprocess.Popen(["bash", "-c", cmd], stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            with contextlib.suppress(Exception):
+                proc.stdin.write(text.encode())
+                proc.stdin.close()
+            proc.wait()
+        except Exception as exc:
+            log("tts:", exc)
+
+
+def shell_quote(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def tts_clean(text):
+    """Strip everything that sounds like punctuation soup when spoken."""
+    text = re.sub(r"```.*?```", " (code omitted) ", str(text or ""), flags=re.S)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.M)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
+    text = re.sub(r"https?://\S+", "a link", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:1400]
+
+
+def play(path):
+    if not os.path.exists(path):
+        return
+    with contextlib.suppress(Exception):
+        subprocess.Popen(["pw-play", path], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+
+# --------------------------------------------------------------------- claude
+
+class Claude:
+    def __init__(self, cfg, daemon):
+        self.cfg = cfg
+        self.daemon = daemon
+        self.binary = shutil.which("claude") or os.path.expanduser(
+            "~/.local/share/mise/installs/claude/latest/claude")
+        self.session_id = None
+        self.last_turn = 0.0
+        self.proc = None
+        self.cancelled = False
+
+    def available(self):
+        return bool(self.binary and os.path.exists(self.binary))
+
+    def reset(self):
+        self.session_id = None
+
+    def cancel(self):
+        self.cancelled = True
+        if self.proc and self.proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self.proc.terminate()
+
+    def build_command(self, prompt, unguarded=False):
+        cfg = self.cfg
+        mode = cfg.get("autoMode", "scoped")
+        cmd = [self.binary, "-p", prompt,
+               "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages",
+               "--append-system-prompt", cfg["systemPrompt"]]
+        if mode == "ask":
+            cmd += ["--permission-mode", "plan"]
+        else:
+            cmd += ["--permission-mode", "bypassPermissions"]
+        if self.session_id and time.time() - self.last_turn < cfg["sessionIdleSeconds"]:
+            cmd += ["--resume", self.session_id]
+        if mode == "scoped" and not unguarded:
+            settings = self.daemon.guard_settings_path
+            if settings:
+                cmd += ["--settings", settings]
+        return cmd
+
+    def ask(self, prompt, unguarded=False):
+        """Run one turn, streaming events onto the bus. Returns the reply."""
+        self.cancelled = False
+        workspace = os.path.expanduser(self.cfg["workspace"])
+        os.makedirs(workspace, exist_ok=True)
+        cmd = self.build_command(prompt, unguarded)
+        env = dict(os.environ)
+        env["JUNO"] = "1"
+        if unguarded:
+            env["JUNO_UNGUARDED"] = "1"
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=workspace, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                text=True, bufsize=1, env=env)
+        except Exception as exc:
+            BUS.emit(t="error", message=f"Could not start Claude: {exc}")
+            return ""
+
+        reply = []
+        tools = {}
+        for line in self.proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self.handle_event(event, reply, tools)
+        err = ""
+        with contextlib.suppress(Exception):
+            err = self.proc.stderr.read() or ""
+        code = self.proc.wait()
+        self.proc = None
+        if self.cancelled:
+            return ""
+        text = "".join(reply).strip()
+        if code != 0 and not text:
+            snippet = err.strip().splitlines()[-1] if err.strip() else f"exit {code}"
+            BUS.emit(t="error", message=f"Claude failed: {snippet[:200]}")
+            return ""
+        self.last_turn = time.time()
+        return text
+
+    def handle_event(self, event, reply, tools):
+        kind = event.get("type")
+
+        if kind == "system" and event.get("subtype") == "init":
+            self.session_id = event.get("session_id") or self.session_id
+            BUS.emit(t="session", id=self.session_id,
+                     model=event.get("model", ""),
+                     cwd=event.get("cwd", ""))
+            return
+
+        if kind == "stream_event":
+            inner = event.get("event") or {}
+            if inner.get("type") == "content_block_start":
+                # A reply can arrive as several text blocks — one before a
+                # tool call and one after. Without a break they run together
+                # mid-sentence ("…command now.That got blocked").
+                block = inner.get("content_block") or {}
+                if block.get("type") == "text" and reply:
+                    reply.append("\n\n")
+                    BUS.emit(t="delta", text="\n\n")
+                return
+            if inner.get("type") == "content_block_delta":
+                delta = inner.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    chunk = delta.get("text") or ""
+                    if chunk:
+                        reply.append(chunk)
+                        BUS.emit(t="delta", text=chunk)
+                elif delta.get("type") == "thinking_delta":
+                    BUS.emit(t="thinking", text=delta.get("thinking") or "")
+            return
+
+        if kind == "assistant":
+            for block in (event.get("message") or {}).get("content") or []:
+                if block.get("type") == "tool_use":
+                    tid = block.get("id") or uuid.uuid4().hex
+                    name = block.get("name") or "tool"
+                    tools[tid] = name
+                    BUS.emit(t="tool", id=tid, name=name,
+                             detail=tool_detail(name, block.get("input") or {}))
+                elif block.get("type") == "text" and not reply:
+                    # No partial stream arrived (older CLI): take the whole
+                    # block so the UI still shows something.
+                    chunk = block.get("text") or ""
+                    if chunk:
+                        reply.append(chunk)
+                        BUS.emit(t="delta", text=chunk)
+            return
+
+        if kind == "user":
+            for block in (event.get("message") or {}).get("content") or []:
+                if block.get("type") != "tool_result":
+                    continue
+                tid = block.get("tool_use_id")
+                ok = not block.get("is_error")
+                body = block.get("content")
+                if isinstance(body, list):
+                    body = " ".join(str(b.get("text", "")) for b in body
+                                    if isinstance(b, dict))
+                body = str(body or "")
+                if not ok:
+                    hit = self.daemon.blocked_reason(body)
+                    if hit:
+                        BUS.emit(t="blocked", reason=hit, detail=body[:400])
+                BUS.emit(t="tool_done", id=tid, ok=ok,
+                         name=tools.get(tid, "tool"), summary=body[:240])
+            return
+
+        if kind == "result":
+            BUS.emit(t="turn_meta",
+                     duration=event.get("duration_ms", 0),
+                     cost=event.get("total_cost_usd", 0),
+                     turns=event.get("num_turns", 0),
+                     error=bool(event.get("is_error")))
+
+
+def tool_detail(name, payload):
+    """One short human line per tool call — this is what scrolls past in the
+    activity rail while Juno works."""
+    def s(key, limit=90):
+        return str(payload.get(key, ""))[:limit]
+
+    if name == "Bash":
+        return s("command", 120)
+    if name in ("Read", "Write", "Edit", "NotebookEdit"):
+        return os.path.basename(s("file_path")) or s("file_path")
+    if name in ("Grep", "Glob"):
+        return s("pattern")
+    if name in ("WebSearch",):
+        return s("query")
+    if name in ("WebFetch",):
+        return s("url")
+    if name == "Task":
+        return s("description")
+    return s("description") or ""
+
+
+# ---------------------------------------------------------------------- brain
+
+IDLE, LISTENING, THINKING, SPEAKING = "idle", "listening", "thinking", "speaking"
+
+
+class Juno:
+    def __init__(self):
+        self.cfg = load_config()
+        self.sounds = ensure_sounds()
+        self.state = IDLE
+        self.state_since = time.time()
+        self.jobs = queue.Queue()
+        self.history = self.load_history()
+        self.whisper = Whisper(self.cfg)
+        self.voice = Voice(self.cfg)
+        self.claude = Claude(self.cfg, self)
+        self.wake = WakeWord(self.cfg, self.on_wake_word)
+        self.mic = Microphone(self.cfg, self.on_utterance, self.mic_open,
+                              self.wants_levels,
+                              lambda: self.state == LISTENING,
+                              self.wake.push)
+        self.follow_until = 0.0
+        # A follow-up window that re-arms after every answer is a loop: one
+        # wake, then any noise becomes a command, and answering it opens the
+        # window again. The chain is capped so Juno always returns to needing
+        # her name.
+        self.follow_turns = 0
+        self.last_prompt = ""
+        self.last_block = None
+        self.hide_at = 0.0
+        self.dropped_segments = 0
+        # Raised for the whole time audio is leaving the speakers, plus a
+        # tail for what is still in the room. Juno answering her own voice
+        # is the classic failure of an always-listening assistant.
+        self.tts_until = 0.0
+        # Levels flow only while a UI says it is visible, and lapse on
+        # their own if that UI dies without saying goodbye.
+        self.levels_until = 0.0
+        self.guard_settings_path = self.write_guard_settings()
+        self.stopping = threading.Event()
+
+    # ----------------------------------------------------------- persistence
+
+    def load_history(self):
+        try:
+            with open(HISTORY_PATH) as fh:
+                data = json.load(fh)
+            return data[-60:] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def save_history(self):
+        os.makedirs(STATE, exist_ok=True)
+        tmp = HISTORY_PATH + ".tmp"
+        with contextlib.suppress(Exception):
+            with open(tmp, "w") as fh:
+                json.dump(self.history[-60:], fh)
+            os.replace(tmp, HISTORY_PATH)
+
+    def remember(self, role, text):
+        if not text:
+            return
+        self.history.append({"role": role, "text": text, "ts": time.time()})
+        self.history = self.history[-60:]
+        self.save_history()
+
+    def write_guard_settings(self):
+        """Scoped auto still means auto — the guard only stands between Juno
+        and the handful of commands you can't take back."""
+        if self.cfg.get("autoMode") != "scoped":
+            return None
+        guard = os.path.join(SHARE, "juno-guard")
+        if not os.path.exists(guard):
+            return None
+        path = os.path.join(SHARE, "guard-settings.json")
+        settings = {
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": guard, "timeout": 10}],
+                }]
+            }
+        }
+        with contextlib.suppress(Exception):
+            with open(path, "w") as fh:
+                json.dump(settings, fh, indent=2)
+            return path
+        return None
+
+    @staticmethod
+    def blocked_reason(body):
+        m = re.search(r"JUNO_BLOCKED:\s*(.+)", str(body or ""))
+        return m.group(1).strip()[:160] if m else None
+
+    # ------------------------------------------------------------ state ---
+
+    # ------------------------------------------------------------- surface
+
+    def shell_ipc(self, *args):
+        """Best effort. A missing shell must never stall the brain thread."""
+        with contextlib.suppress(Exception):
+            subprocess.Popen(["omarchy-shell", *args],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+
+    def show_ui(self):
+        if not self.cfg.get("autoShow", True):
+            return
+        self.shell_ipc("shell", "summon", self.cfg["pluginId"], "{}")
+
+    def hide_ui(self):
+        self.shell_ipc("shell", "hide", self.cfg["pluginId"])
+
+    def write_state_file(self):
+        """The bar widget watches this instead of holding a socket open."""
+        path = os.path.join(RUNTIME, "juno-state.json")
+        payload = {
+            "state": self.state,
+            "muted": bool(self.cfg.get("micMuted")),
+            "speak": bool(self.cfg.get("speak", True)),
+            "ts": time.time(),
+        }
+        with contextlib.suppress(Exception):
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, path)
+
+    def set_state(self, state):
+        if state == self.state:
+            return
+        self.state = state
+        self.state_since = time.time()
+        # Detector runs only while waiting to be woken.
+        with contextlib.suppress(Exception):
+            self.wake.paused = state != IDLE
+        self.write_state_file()
+        BUS.emit(t="state", state=state)
+        if state == IDLE:
+            self.hide_at = time.time() + self.cfg.get("autoHideSeconds", 25) \
+                if self.cfg.get("autoHideSeconds", 25) else 0
+        else:
+            self.hide_at = 0
+            self.show_ui()
+
+    def wants_levels(self):
+        return time.time() < self.levels_until
+
+    def mic_open(self):
+        """Whether raw audio should reach the VAD at all. Juno never listens
+        to itself — that is how assistants end up in conversation with their
+        own voice."""
+        if self.cfg.get("micMuted"):
+            return False
+        if time.time() < self.tts_until:
+            return False
+        return self.state in (IDLE, LISTENING)
+
+    def say(self, text):
+        """The only way anything reaches the speakers. Holds the microphone
+        shut for the duration and half a second past it, so the tail of a
+        sentence in a live room cannot come back as a command."""
+        self.tts_until = time.time() + 3600      # closed until proven open
+        try:
+            self.voice.speak(text)
+        finally:
+            # Reverb outlives the speaker. Half a second was not enough on
+            # this desk; the tail of her own sentence was still arriving.
+            self.tts_until = time.time() + float(self.cfg.get("micReopenDelay", 1.4))
+
+    def snapshot(self):
+        return {
+            "t": "hello",
+            "state": self.state,
+            "history": self.history[-40:],
+            "config": {
+                "wakeWord": self.cfg["wakeWord"],
+                "speak": bool(self.cfg.get("speak", True)),
+                "micMuted": bool(self.cfg.get("micMuted")),
+                "autoMode": self.cfg.get("autoMode", "scoped"),
+                "workspace": self.cfg["workspace"],
+            },
+            "health": {
+                "whisper": self.whisper.ready,
+                "voice": self.voice.available(),
+                "wake": self.wake.ready,
+                "wakeDropped": self.wake.dropped,
+                "voiceEngine": self.voice.engine,
+                "claude": self.claude.available(),
+                "model": str(self.cfg.get("sttModel", "base")) + " int8",
+                "language": self.whisper.last_language or "—",
+            },
+        }
+
+    # ------------------------------------------------------------ input ---
+
+    def on_wake_word(self, score):
+        """The detector fired. This is the reliable path in — it does not go
+        through the audio queue, and it does not wait for a transcript."""
+        if self.state != IDLE or time.time() < self.tts_until:
+            return
+        log(f"wake: detected ({score:.2f})")
+        BUS.emit(t="wake", heard=str(self.cfg.get("wakeWord")), score=score)
+        self.begin_listening()
+
+    def on_utterance(self, pcm):
+        seconds = len(pcm) / (SAMPLE_RATE * 2)
+        if seconds < 0.20:
+            return
+        # A room with a television in it produces speech-shaped audio faster
+        # than this CPU can transcribe it, so the queue grows without bound
+        # and everything — including the thing you actually said — arrives
+        # tens of seconds late. Keep only the newest segments; older ones
+        # describe a moment that has already passed.
+        while self.jobs.qsize() >= self.cfg.get("maxPendingSegments", 2):
+            try:
+                dropped = self.jobs.get_nowait()
+                if dropped[0] == "audio":
+                    self.dropped_segments += 1
+            except queue.Empty:
+                break
+        self.jobs.put(("audio", (pcm, time.time())))
+
+    def command(self, msg):
+        cmd = msg.get("cmd")
+        if cmd == "wake":
+            # Handled inline, not queued. Push-to-talk exists precisely for
+            # when the room is too loud for the wake word, which is exactly
+            # when the audio queue is deepest — putting it behind that queue
+            # made the one reliable way in unresponsive.
+            self.begin_listening(manual=True)
+        elif cmd == "ask":
+            text = str(msg.get("text") or "").strip()
+            if text:
+                self.jobs.put(("ask", text))
+        elif cmd == "cancel":
+            self.claude.cancel()
+            self.voice.stop()
+            self.set_state(IDLE)
+            self.follow_until = 0
+        elif cmd == "say":
+            text = str(msg.get("text") or "").strip()
+            if text:
+                threading.Thread(target=self.say, args=(text,),
+                                 daemon=True).start()
+        elif cmd == "stop_speaking":
+            self.voice.stop()
+        elif cmd == "retry_unguarded":
+            if self.last_prompt:
+                self.jobs.put(("unguarded", self.last_prompt))
+        elif cmd == "clear":
+            self.history = []
+            self.save_history()
+            self.claude.reset()
+            BUS.emit(t="cleared")
+        elif cmd == "set":
+            key, value = msg.get("key"), msg.get("value")
+            if key in ("speak", "micMuted"):
+                self.cfg[key] = bool(value)
+                self.persist_config()
+                self.write_state_file()
+                BUS.emit(t="config", key=key, value=self.cfg[key])
+        elif cmd == "levels":
+            # Refreshed by the overlay while it is on screen; a stale claim
+            # expires rather than streaming forever.
+            self.levels_until = time.time() + 30 if msg.get("value") else 0.0
+        elif cmd == "ping":
+            BUS.emit(t="pong")
+        elif cmd == "state":
+            BUS.emit(**self.snapshot())
+
+    def persist_config(self):
+        with contextlib.suppress(Exception):
+            with open(CONFIG_PATH) as fh:
+                stored = json.load(fh)
+        stored = stored if isinstance(stored, dict) else {}
+        stored.update({"speak": self.cfg.get("speak", True),
+                       "micMuted": self.cfg.get("micMuted", False)})
+        with contextlib.suppress(Exception):
+            with open(CONFIG_PATH, "w") as fh:
+                json.dump(stored, fh, indent=2)
+                fh.write("\n")
+
+    # ------------------------------------------------------------- worker ---
+
+    def work(self):
+        while not self.stopping.is_set():
+            try:
+                kind, payload = self.jobs.get(timeout=0.5)
+            except queue.Empty:
+                self.expire_follow_up()
+                self.expire_overlay()
+                continue
+            try:
+                if kind == "audio":
+                    pcm, captured = payload
+                    age = time.time() - captured
+                    # Answering a question you asked fifteen seconds ago is
+                    # worse than not answering it.
+                    if age > self.cfg.get("maxSegmentAgeSeconds", 8):
+                        self.dropped_segments += 1
+                        log(f"  skipped a segment {age:.0f}s stale")
+                        continue
+                    self.handle_audio(pcm)
+                elif kind == "wake":
+                    self.begin_listening(manual=True)
+                elif kind == "ask":
+                    self.answer(payload, spoken=False)
+                elif kind == "unguarded":
+                    self.answer(payload, spoken=False, unguarded=True)
+            except Exception as exc:
+                log("worker:", exc)
+                BUS.emit(t="error", message=str(exc)[:200])
+                self.set_state(IDLE)
+
+    def expire_overlay(self):
+        if self.hide_at and time.time() > self.hide_at:
+            self.hide_at = 0
+            self.hide_ui()
+
+    def expire_follow_up(self):
+        if self.state == LISTENING and self.follow_until and time.time() > self.follow_until:
+            self.follow_until = 0
+            self.follow_turns = 0
+            self.set_state(IDLE)
+            if self.cfg.get("chime", True):
+                play(os.path.join(self.sounds, "done.wav"))
+            BUS.emit(t="sleep")
+
+    def handle_audio(self, pcm):
+        # With a real wake detector running, transcribing while idle buys
+        # nothing and costs everything: in two and a half minutes of this
+        # room it ran whisper forty-five times on noise, every one of them
+        # discarded. The detector is the only thing that needs to be awake
+        # between conversations.
+        if (self.state == IDLE and self.wake.ready
+                and not self.cfg.get("transcriptWakeFallback")):
+            return
+        seconds = len(pcm) / (SAMPLE_RATE * 2)
+        started = time.time()
+        text = self.whisper.transcribe(pcm, accurate=(self.state == LISTENING))
+        took = time.time() - started
+        no_speech = self.whisper.last_no_speech
+        logprob = self.whisper.last_logprob
+        log(f'heard[{self.state}] {seconds:.1f}s -> "{text}" '
+            f'({took:.1f}s, no_speech={no_speech:.2f}, logprob={logprob:.2f})')
+
+        # A transcript whisper is not confident in is noise wearing words.
+        if text and (no_speech > self.cfg["maxNoSpeech"]
+                     or logprob < self.cfg["minLogProb"]):
+            log(f"  discarded as noise (no_speech={no_speech:.2f}, "
+                f"logprob={logprob:.2f})")
+            BUS.emit(t="noise", text=text, no_speech=round(no_speech, 3))
+            return
+        BUS.emit(t="transcript", text=text, seconds=round(seconds, 2),
+                 state=self.state)
+        if not text:
+            if self.state == LISTENING:
+                BUS.emit(t="misheard")
+            return
+
+        if self.state == LISTENING:
+            self.follow_until = 0
+            self.answer(text, spoken=True)
+            return
+
+        matched, remainder = wake_split(text, self.cfg)
+        if not matched:
+            log(f'  no wake match in "{normalize(text)}"')
+            return
+        BUS.emit(t="wake", heard=text)
+        self.follow_turns = 0
+        if self.whisper.last_language == "hi" and self.cfg.get("sttModelHindi"):
+            # The cheap pass was enough to hear the name; the command itself
+            # deserves the accurate model.
+            better = self.whisper.transcribe(pcm, accurate=True)
+            if better:
+                matched2, remainder2 = wake_split(better, self.cfg)
+                log(f'  re-read accurately -> "{better}"')
+                if matched2:
+                    remainder = remainder2
+
+        if remainder and len(remainder.split()) >= 2:
+            # "Juno, what's on my calendar" — one breath, one answer.
+            self.answer(remainder, spoken=True, chime=True)
+        else:
+            self.begin_listening()
+
+    def begin_listening(self, manual=False):
+        self.follow_turns = 0
+        if self.cfg.get("chime", True):
+            play(os.path.join(self.sounds, "wake.wav"))
+        self.set_state(LISTENING)
+        self.follow_until = time.time() + self.cfg["followUpSeconds"]
+        BUS.emit(t="awake", manual=manual)
+
+    # ------------------------------------------------------------- answer ---
+
+    def answer(self, prompt, spoken, unguarded=False, chime=False):
+        if not self.claude.available():
+            BUS.emit(t="error", message="The claude CLI is not installed.")
+            play(os.path.join(self.sounds, "error.wav"))
+            self.set_state(IDLE)
+            return
+        if chime and self.cfg.get("chime", True):
+            play(os.path.join(self.sounds, "wake.wav"))
+        self.last_prompt = prompt
+        self.remember("user", prompt)
+        BUS.emit(t="user", text=prompt)
+        self.set_state(THINKING)
+
+        reply = self.claude.ask(prompt, unguarded=unguarded)
+
+        if self.claude.cancelled:
+            self.set_state(IDLE)
+            return
+        if not reply:
+            play(os.path.join(self.sounds, "error.wav"))
+            self.set_state(IDLE)
+            return
+
+        self.remember("assistant", reply)
+        BUS.emit(t="assistant", text=reply)
+
+        if spoken and self.cfg.get("speak", True) and self.voice.available():
+            self.set_state(SPEAKING)
+            self.say(reply)
+
+        if self.cfg.get("chime", True):
+            play(os.path.join(self.sounds, "done.wav"))
+
+        if spoken and self.follow_turns < self.cfg["followUpMaxTurns"]:
+            # Hold the floor briefly so a follow-up needs no wake word.
+            self.follow_turns += 1
+            self.set_state(LISTENING)
+            self.follow_until = time.time() + self.cfg["followUpSeconds"]
+            BUS.emit(t="listening_followup",
+                     seconds=self.cfg["followUpSeconds"],
+                     remaining=self.cfg["followUpMaxTurns"] - self.follow_turns)
+        else:
+            self.follow_turns = 0
+            self.set_state(IDLE)
+            if spoken:
+                play(os.path.join(self.sounds, "done.wav"))
+            BUS.emit(t="sleep")
+
+    # --------------------------------------------------------------- run ---
+
+    def run(self):
+        log("juno: starting")
+        self.whisper.start()
+        self.wake.start()
+        threading.Thread(target=self.voice.ensure, daemon=True).start()
+        self.write_state_file()
+        self.mic.start()
+        threading.Thread(target=self.work, name="brain", daemon=True).start()
+        BUS.emit(**self.snapshot())
+        server = make_server(self)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        log(f"juno: listening for '{self.cfg['wakeWord']}' — socket {SOCKET_PATH}")
+        if not self.whisper.ready:
+            log("juno: WARNING no speech model; text input still works")
+        try:
+            while not self.stopping.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown(server)
+
+    def shutdown(self, server=None):
+        self.stopping.set()
+        with contextlib.suppress(Exception):
+            self.mic.stop()
+        with contextlib.suppress(Exception):
+            self.wake.stop()
+        with contextlib.suppress(Exception):
+            self.voice.teardown()
+        with contextlib.suppress(Exception):
+            self.whisper.stop()
+        if server:
+            with contextlib.suppress(Exception):
+                server.shutdown()
+        with contextlib.suppress(OSError):
+            os.remove(SOCKET_PATH)
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(RUNTIME, "juno-state.json"))
+        log("juno: stopped")
+
+
+# --------------------------------------------------------------------- socket
+
+def make_server(juno):
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            q = queue.Queue(maxsize=256)
+            BUS.add(q)
+            stop = threading.Event()
+
+            def writer():
+                try:
+                    self.wfile.write((json.dumps(juno.snapshot()) + "\n").encode())
+                    self.wfile.flush()
+                    while not stop.is_set():
+                        try:
+                            payload = q.get(timeout=0.4)
+                        except queue.Empty:
+                            continue
+                        self.wfile.write(payload)
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ValueError, OSError):
+                    pass
+                finally:
+                    stop.set()
+
+            t = threading.Thread(target=writer, daemon=True)
+            t.start()
+            try:
+                for line in self.rfile:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        juno.command(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+            except OSError:
+                pass
+            finally:
+                stop.set()
+                BUS.remove(q)
+
+    class Server(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    if os.path.exists(SOCKET_PATH):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.3)
+                probe.connect(SOCKET_PATH)
+            log("juno: another daemon already owns the socket")
+            sys.exit(1)
+        except OSError:
+            os.remove(SOCKET_PATH)
+    server = Server(SOCKET_PATH, Handler)
+    os.chmod(SOCKET_PATH, 0o600)
+    return server
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    juno = Juno()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: juno.stopping.set())
+    juno.run()
+
+
+if __name__ == "__main__":
+    main()
