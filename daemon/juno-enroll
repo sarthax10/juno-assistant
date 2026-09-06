@@ -1,4 +1,4 @@
-#!/home/sandbox/.local/share/juno/venv/bin/python
+#!/usr/bin/env python3
 """
 Teach the wake word your voice.
 

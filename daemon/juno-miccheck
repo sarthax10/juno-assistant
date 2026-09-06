@@ -1,4 +1,4 @@
-#!/home/sandbox/.local/share/juno/venv/bin/python
+#!/usr/bin/env python3
 """
 Record a few seconds and report what the wake detector made of it.
 

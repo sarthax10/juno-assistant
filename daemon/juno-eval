@@ -1,4 +1,4 @@
-#!/home/sandbox/.local/share/juno/venv/bin/python
+#!/usr/bin/env python3
 """
 Measure recognition on a real human voice — yours.
 
