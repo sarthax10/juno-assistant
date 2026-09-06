@@ -21,7 +21,7 @@ USAGE = """juno — voice assistant control
   juno enroll [takes]    train the wake word on your own voice
   juno eval [secs]       measure accuracy on YOUR voice, not synthetic
   juno miccheck [secs]   record yourself and score the wake word
-  juno threshold [n]     show or set the wake sensitivity
+  juno sensitivity [n]   show or set wake sensitivity (higher = easier)
   juno cancel            stop the current turn
   juno mute / unmute     toggle the microphone
   juno quiet / speak     toggle the spoken voice
@@ -131,6 +131,17 @@ def main():
     if cmd in ("miccheck", "testmic", "mictest"):
         os.execv(os.path.expanduser("~/.local/share/juno/juno-miccheck"),
                  ["juno-miccheck"] + rest)
+    if cmd in ("sensitivity", "kwsscore"):
+        import json as _json
+        path = os.path.expanduser("~/.config/juno/config.json")
+        cfg = _json.load(open(path))
+        if not rest:
+            print(cfg.get("wakeKwsScore", 4.0)); return 0
+        cfg["wakeKwsScore"] = float(rest[0])
+        _json.dump(cfg, open(path, "w"), indent=2, ensure_ascii=False)
+        subprocess.run(["systemctl", "--user", "restart", "juno.service"])
+        print(f"wake sensitivity set to {cfg['wakeKwsScore']}")
+        return 0
     if cmd == "threshold":
         import json as _json
         path = os.path.expanduser("~/.config/juno/config.json")

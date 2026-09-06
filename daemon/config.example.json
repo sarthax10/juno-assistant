@@ -82,8 +82,8 @@
   "ttsDrainSeconds": 0.5,
   "micReopenDelay": 1.4,
   "wakeEngine": "sherpa",
-  "wakePhrases": "HEY JARVIS",
-  "wakeKwsScore": 4.0,
+  "wakePhrases": "HEY JARVIS,JARVIS",
+  "wakeKwsScore": 8.0,
   "wakeKwsThreshold": 0.01,
   "micSource": "default"
 }

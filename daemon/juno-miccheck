@@ -2,9 +2,11 @@
 """
 Record a few seconds and report what the wake detector made of it.
 
-Answers the question the logs cannot: when you say the phrase and nothing
-happens, was your voice too quiet, was it drowned by the room, or did it
-reach the model and simply not score high enough?
+Runs whichever engine is actually configured, and transcribes the same audio
+so the two can be compared. That distinction is the whole point: if speech
+recognition heard the phrase clearly and the wake detector still did not
+fire, the problem is the detector's tuning, not your microphone or your
+voice.
 """
 import json
 import os
@@ -13,70 +15,138 @@ import sys
 import wave
 
 import numpy as np
-from openwakeword.model import Model
 
-SECONDS = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 SHARE = os.path.expanduser("~/.local/share/juno")
 CFG = os.path.expanduser("~/.config/juno/config.json")
+SECONDS = int(sys.argv[1]) if len(sys.argv) > 1 else 6
+
+
+def record(seconds, source):
+    cmd = ["timeout", str(seconds + 1), "pw-record", "--raw", "--rate", "16000",
+           "--channels", "1", "--format", "s16"]
+    if source and source != "default":
+        cmd += ["--target", source]
+    cmd += ["-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    raw = p.stdout.read()
+    p.wait()
+    return raw
+
+
+def sherpa_scan(cfg, audio):
+    import sherpa_onnx
+    K = os.path.join(SHARE, "kws")
+    keywords = os.path.join(SHARE, "wake-keywords.txt")
+    if not os.path.exists(keywords):
+        return None, "no encoded keywords — start the service once first"
+
+    def m(n):
+        return os.path.join(K, f"{n}-epoch-12-avg-2-chunk-16-left-64.int8.onnx")
+
+    best = None
+    # Sweep the sensitivity so a miss reports how far off it was, rather
+    # than just "no".
+    for score in (cfg.get("wakeKwsScore", 4.0), 6.0, 8.0):
+        sp = sherpa_onnx.KeywordSpotter(
+            tokens=os.path.join(K, "tokens.txt"),
+            encoder=m("encoder"), decoder=m("decoder"), joiner=m("joiner"),
+            keywords_file=keywords, num_threads=2, provider="cpu",
+            keywords_score=float(score),
+            keywords_threshold=float(cfg.get("wakeKwsThreshold", 0.01)),
+            num_trailing_blanks=1)
+        st = sp.create_stream()
+        hits = []
+        a = audio.astype(np.float32) / 32768.0
+        for i in range(0, len(a), 1600):
+            st.accept_waveform(16000, a[i:i + 1600])
+            while sp.is_ready(st):
+                sp.decode_stream(st)
+                r = sp.get_result(st)
+                if r:
+                    hits.append(r)
+                    sp.reset_stream(st)
+        st.accept_waveform(16000, np.zeros(8000, dtype=np.float32))
+        while sp.is_ready(st):
+            sp.decode_stream(st)
+            r = sp.get_result(st)
+            if r:
+                hits.append(r)
+        if hits:
+            return score, hits
+        best = score
+    return None, None
+
+
+def transcribe(audio):
+    """What the speech recogniser heard, for comparison."""
+    sys.path.insert(0, SHARE)
+    code = open(os.path.join(SHARE, "juno-daemon")).read()
+    d = type(sys)("jd"); d.__dict__["__name__"] = "jd"
+    exec(compile(code, "juno-daemon", "exec"), d.__dict__)
+    cfg = d.load_config()
+    w = d.Whisper(cfg)
+    w.start()
+    try:
+        return w.transcribe(audio.tobytes(), accurate=True)
+    finally:
+        w.stop()
 
 
 def main():
-    try:
-        cfg = json.load(open(CFG))
-    except Exception:
-        cfg = {}
-    phrase = cfg.get("wakeWord", "Jarvis")
-    threshold = float(cfg.get("wakeThreshold", 0.35))
-    model_name = cfg.get("wakeModel", "hey_jarvis_v0.1.onnx")
-
-    print(f'Say "Hey {phrase}" now — recording {SECONDS} seconds...', flush=True)
-    raw = subprocess.run(
-        ["pw-record", "--raw", "--rate", "16000", "--channels", "1",
-         "--format", "s16", "-"],
-        capture_output=True, timeout=SECONDS + 4).stdout if False else None
-    proc = subprocess.Popen(
-        ["timeout", str(SECONDS), "pw-record", "--raw", "--rate", "16000",
-         "--channels", "1", "--format", "s16", "-"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    raw = proc.stdout.read()
-    proc.wait()
-
+    cfg = json.load(open(CFG)) if os.path.exists(CFG) else {}
+    phrases = cfg.get("wakePhrases", "HEY JARVIS")
+    print(f'Say "{phrases.split(",")[0].title()}" now — recording {SECONDS} seconds...',
+          flush=True)
+    raw = record(SECONDS, cfg.get("micSource"))
     if not raw:
-        print("No audio captured at all — the microphone is not delivering.")
+        print("No audio captured — the microphone is not delivering.")
         return 1
-
     audio = np.frombuffer(raw, dtype=np.int16)
+    with wave.open("/tmp/miccheck.wav", "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes(raw)
+
     frames = [audio[i:i + 320] for i in range(0, len(audio) - 320, 320)]
     levels = sorted(float(np.sqrt(np.mean(f.astype(np.float64) ** 2)) / 32768)
                     for f in frames)
     median, peak = levels[len(levels) // 2], levels[-1]
 
-    base = os.path.join(os.path.dirname(__import__("openwakeword").__file__),
-                        "resources", "models")
-    path = model_name if os.path.isabs(model_name) else os.path.join(base, model_name)
-    model = Model(wakeword_model_paths=[path])
-    best = 0.0
-    for i in range(0, len(audio) - 1280, 1280):
-        best = max(best, max(model.predict(audio[i:i + 1280]).values()))
-
     print()
     print(f"  background level   {median:.4f}   (a quiet room is about 0.005)")
     print(f"  loudest moment     {peak:.4f}")
-    print(f"  best wake score    {best:.3f}   (needs {threshold})")
+
+    engine = cfg.get("wakeEngine", "sherpa")
+    if engine == "sherpa":
+        score, hits = sherpa_scan(cfg, audio)
+        if hits and score is not None:
+            configured = float(cfg.get("wakeKwsScore", 4.0))
+            print(f"  wake detector      FIRED on {hits} at score {score}")
+            if score > configured:
+                print()
+                print(f"  It only fired at sensitivity {score}, and yours is set to")
+                print(f"  {configured}. Raise it:   jarvis sensitivity {score}")
+            else:
+                print()
+                print("  PASS — that would have woken it.")
+            print(f"\n  recording kept at /tmp/miccheck.wav")
+            return 0
+        print("  wake detector      did not fire, even at sensitivity 8.0")
+
+    print("\n  Checking what the speech recogniser heard from the same audio...")
+    heard = transcribe(audio)
+    print(f'  transcribed:       "{heard}"')
     print()
-    if best >= threshold:
-        print(f"  PASS — that would have woken {phrase}.")
-    elif peak < median * 3:
-        print("  Your voice never rose above the room. Either the microphone")
-        print("  did not pick you up, or the background is as loud as you are.")
-        print("  Move closer to the microphone and try again.")
-    elif best >= threshold * 0.5:
-        print(f"  Close — it heard the phrase but scored {best:.2f}. Lower the")
-        print(f"  bar with:  jarvis threshold {max(0.15, best - 0.05):.2f}")
+    if not heard.strip():
+        print("  Nothing was recognised as speech at all. Either the microphone")
+        print("  did not pick you up, or the room is as loud as you are.")
+    elif "jarvis" in heard.lower() or "jarvi" in heard.lower():
+        print("  Your voice IS clear — recognition heard the phrase and the wake")
+        print("  detector still missed it. That is a tuning problem. Send me this")
+        print("  output and /tmp/miccheck.wav and I will fix the sensitivity.")
     else:
-        print("  Your voice reached the microphone clearly, but the model did")
-        print(f"  not recognise the phrase. Say it as one phrase — \"hey {phrase.lower()}\" —")
-        print("  rather than pausing between the two words.")
+        print("  The phrase did not come through as spoken. Try saying it as one")
+        print("  phrase, slightly slower, closer to the microphone.")
+    print(f"\n  recording kept at /tmp/miccheck.wav")
     return 0
 
 
