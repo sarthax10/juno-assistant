@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+Choose a wake word by testing candidates against your actual voice.
+
+"Hey Jarvis" does not survive this user's pronunciation: the recogniser
+renders it "He's always", and the keyword spotter finds nothing in it at any
+sensitivity. Guessing a replacement wastes everyone's time, and training a
+personal model needs far more data than a few minutes of enrollment provides
+— twelve takes produced a classifier that fired on half of the user's
+ordinary commands.
+
+The keyword spotter takes any phrase as plain text with no training, so the
+cheap move is to try several and measure. This records you saying each
+candidate once, checks which ones the spotter detects, and checks each
+against your existing command recordings so a phrase that fires on ordinary
+speech is rejected rather than discovered later.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import wave
+
+import numpy as np
+
+SHARE = os.path.expanduser("~/.local/share/juno")
+CFG = os.path.expanduser("~/.config/juno/config.json")
+K = os.path.join(SHARE, "kws")
+V = os.path.join(SHARE, "venv/bin")
+OUT = os.path.join(SHARE, "wakepick")
+
+CANDIDATES = ["HEY JARVIS", "COMPUTER", "ORACLE", "SENTINEL", "FRIDAY", "PHOENIX"]
+
+
+def record(seconds, source):
+    cmd = ["timeout", str(seconds + 1), "pw-record", "--raw", "--rate", "16000",
+           "--channels", "1", "--format", "s16"]
+    if source and source != "default":
+        cmd += ["--target", source]
+    cmd += ["-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    raw = p.stdout.read()
+    p.wait()
+    return raw
+
+
+def encode(phrase, path):
+    raw = "/tmp/wp_raw.txt"
+    open(raw, "w").write(phrase + "\n")
+    subprocess.run([f"{V}/sherpa-onnx-cli", "text2token",
+                    "--tokens", f"{K}/tokens.txt", "--tokens-type", "bpe",
+                    "--bpe-model", f"{K}/bpe.model", raw, path],
+                   capture_output=True)
+    return path
+
+
+def spotter(kw, score):
+    import sherpa_onnx
+
+    def m(n):
+        return f"{K}/{n}-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+
+    return sherpa_onnx.KeywordSpotter(
+        tokens=f"{K}/tokens.txt", encoder=m("encoder"), decoder=m("decoder"),
+        joiner=m("joiner"), keywords_file=kw, num_threads=2, provider="cpu",
+        keywords_score=score, keywords_threshold=0.01, num_trailing_blanks=1)
+
+
+def scan(sp, audio):
+    a = audio.astype(np.float32) / 32768.0
+    st = sp.create_stream()
+    hits = []
+    for i in range(0, len(a), 1600):
+        st.accept_waveform(16000, a[i:i + 1600])
+        while sp.is_ready(st):
+            sp.decode_stream(st)
+            r = sp.get_result(st)
+            if r:
+                hits.append(r)
+                sp.reset_stream(st)
+    st.accept_waveform(16000, np.zeros(8000, dtype=np.float32))
+    while sp.is_ready(st):
+        sp.decode_stream(st)
+        r = sp.get_result(st)
+        if r:
+            hits.append(r)
+    return hits
+
+
+def main():
+    cfg = json.load(open(CFG)) if os.path.exists(CFG) else {}
+    os.makedirs(OUT, exist_ok=True)
+    negatives = []
+    for f in sorted(glob.glob(f"{SHARE}/eval/*.wav")):
+        w = wave.open(f)
+        negatives.append(np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16))
+    print(f"Testing {len(CANDIDATES)} candidate wake words against your voice.")
+    print(f"{len(negatives)} of your ordinary commands will be used to reject any")
+    print("phrase that also fires on normal speech.\n")
+
+    takes = {}
+    for phrase in CANDIDATES:
+        input(f'  Press Enter, then say "{phrase.title()}" twice... ')
+        raw = record(4, cfg.get("micSource"))
+        audio = np.frombuffer(raw, dtype=np.int16)
+        peak = float(np.max(np.abs(audio))) / 32768 if len(audio) else 0
+        if peak < 0.05:
+            print("     too quiet, retrying once")
+            raw = record(4, cfg.get("micSource"))
+            audio = np.frombuffer(raw, dtype=np.int16)
+        takes[phrase] = audio
+        with wave.open(os.path.join(OUT, phrase.replace(" ", "_") + ".wav"), "wb") as w:
+            w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+            w.writeframes(audio.tobytes())
+        print(f"     captured (peak {peak:.2f})")
+
+    print("\n" + "=" * 64)
+    print(f"{'phrase':<14}{'detects you':>13}{'false fires':>13}   verdict")
+    results = []
+    for phrase, audio in takes.items():
+        kw = encode(phrase, f"/tmp/wp_{abs(hash(phrase))}.txt")
+        detected_at = None
+        for score in (4.0, 6.0, 8.0):
+            if scan(spotter(kw, score), audio):
+                detected_at = score
+                break
+        false = 0
+        if detected_at:
+            sp = spotter(kw, detected_at)
+            false = sum(1 for n in negatives if scan(sp, n))
+        verdict = ("unusable" if not detected_at else
+                   "GOOD" if false == 0 else f"fires on {false} commands")
+        shown = f"yes @{detected_at}" if detected_at else "no"
+        print(f"{phrase:<14}{shown:>13}{false:>13}   {verdict}")
+        if detected_at and false == 0:
+            results.append((detected_at, phrase))
+
+    print("=" * 64)
+    if not results:
+        print("\nNone of these worked with your voice.")
+        print("Push-to-talk (Super+Alt+Space) stays the reliable way in.")
+        print(f"Recordings kept in {OUT} — send them to me and I will try more.")
+        return 1
+    results.sort()
+    score, phrase = results[0]
+    print(f"\nBest: \"{phrase.title()}\" — detected at sensitivity {score}, no false fires.")
+    if input("Use it as your wake word? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        cfg["wakePhrases"] = phrase
+        cfg["wakeKwsScore"] = score
+        cfg["wakeWord"] = phrase.title().split()[-1]
+        json.dump(cfg, open(CFG, "w"), indent=2, ensure_ascii=False)
+        subprocess.run(["systemctl", "--user", "restart", "juno.service"])
+        print(f'Done. Say "{phrase.title()}".')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

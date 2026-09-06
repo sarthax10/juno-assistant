@@ -206,6 +206,9 @@ DEFAULTS = {
     # How long the microphone stays shut after Juno stops speaking, so the
     # room's reverb does not come back as a command.
     "micReopenDelay": 1.4,
+    # Speak each sentence as Claude finishes writing it, rather than waiting
+    # for the whole reply. Set false to go back to speaking only at the end.
+    "streamSpeech": True,
     # Backlog limits. Transcription is slower than a noisy room generates
     # audio, so both of these have to be small.
     "maxPendingSegments": 2,
@@ -220,7 +223,13 @@ DEFAULTS = {
         "write is spoken aloud by a synthetic voice, so write speech, not "
         "prose.\n"
         "\n"
-        "BE SHORT. This is the single most important rule. Your replies are "
+        "BE SHORT. This is the single most important rule, and you are "
+        "currently failing it. A reply of nine seconds of speech is far too "
+        "long. Aim for one sentence. Two is the maximum. Under twenty words. "
+        "The user is waiting in silence while a synthesizer reads every extra "
+        "word aloud on a slow machine, so length is not free the way it is in "
+        "writing.\n"
+        "More rules on the same point. Your replies are "
         "spoken aloud one word at a time, so every extra sentence is a real "
         "delay the user sits through. One or two sentences. Twenty-five words "
         "is a lot. If they asked a yes/no question, the first word is yes or "
@@ -234,6 +243,14 @@ DEFAULTS = {
         "code blocks unless code was explicitly asked for. A list read aloud "
         "is unbearable; say \"three things\" and then say them.\n"
         "- Lead with the answer, then the detail if it is worth it.\n"
+        "- If you are about to run a command or read a file, say a three or "
+        "four word acknowledgement FIRST, on its own line, before you call "
+        "the tool: \"Checking now.\" / \"One moment.\" / \"Let me look.\" "
+        "Your words are spoken as you write them, so that short line reaches "
+        "the speaker while the command runs and the user hears an answer in "
+        "two seconds instead of waiting ten in silence. Skip it when you can "
+        "answer without tools — an acknowledgement before an instant reply is "
+        "just a delay.\n"
         "- React before you answer when there is something to react to. A "
         "real person says \"oh, that's not good\" before explaining the "
         "error. Openers like Hmm, Oh, Ah, Right, Okay so, Yeah, Alright, "
@@ -245,6 +262,15 @@ DEFAULTS = {
         "me check.\" Not before a fact you are sure of, and not in every "
         "reply. Sprinkled, not sprayed.\n"
         "- Contractions always: it's, you've, that's, I'll, don't.\n"
+        "- DO NOT use the user's name. Almost never. Saying someone's name in "
+        "every reply is the single loudest tell that a machine is talking — "
+        "people who know you do not address you by name each time they answer "
+        "a question. Save it for genuinely getting their attention, which is "
+        "roughly never in a conversation they started.\n"
+        "- Do not open with agreement noises like Sure, Certainly, Of course, "
+        "Absolutely, Great question, or Happy to help. Answer instead.\n"
+        "- Do not close by offering more: no \"let me know if\", no \"anything "
+        "else\", no \"hope that helps\". Stop when the answer stops.\n"
         "- Commas and ellipses become pauses in the voice, so punctuate for "
         "breath rather than for grammar.\n"
         "- Vary your sentence lengths. Uniform rhythm is what makes "
@@ -1048,6 +1074,9 @@ class Voice:
         self.stopped = threading.Event()
         self.done = threading.Event()
         self.done_samples = 0
+        self.pending = 0
+        self.stream_samples = 0
+        self.stream_started = 0.0
         self.bytes_out = 0
         self.last_byte_at = 0.0
         self.first_byte_at = 0.0
@@ -1160,6 +1189,11 @@ class Voice:
             self.last_byte_at = time.time()
             if not self.first_byte_at:
                 self.first_byte_at = time.time()
+                # The number the user actually experiences: silence between
+                # asking and hearing the first word.
+                if self.stream_started:
+                    log(f"tts: first audio after "
+                        f"{self.first_byte_at - self.stream_started:.1f}s")
             if self.discard:
                 continue
             try:
@@ -1184,6 +1218,8 @@ class Voice:
             if text.startswith("DONE "):
                 with contextlib.suppress(ValueError):
                     self.done_samples = int(text.split()[1])
+                    self.stream_samples += self.done_samples
+                self.pending = max(0, self.pending - 1)
                 self.done.set()
             elif text.startswith("ERROR "):
                 log("tts:", text)
@@ -1213,6 +1249,70 @@ class Voice:
                 self.teardown()
 
     # --------------------------------------------------------------- speak
+
+    def begin_stream(self):
+        """Start an utterance that will arrive in pieces."""
+        self.stream_started = time.time()
+        with self.lock:
+            if not self.ensure():
+                return False
+            self.discard = False
+            self.done.clear()
+            self.done_samples = 0
+            self.bytes_out = 0
+            self.last_byte_at = 0.0
+            self.first_byte_at = 0.0
+            self.pending = 0
+            self.stream_samples = 0
+            return True
+
+    def feed(self, text):
+        """Hand one sentence to the synthesizer immediately. Speech starts on
+        the first sentence instead of after the last, which is most of the
+        wait the user actually feels."""
+        text = tts_clean(text)
+        if not text:
+            return
+        with self.lock:
+            if not self.proc or self.proc.poll() is not None:
+                return
+            try:
+                self.done.clear()
+                self.pending += 1
+                self.proc.stdin.write((text.replace("\n", ". ") + "\n").encode())
+                self.proc.stdin.flush()
+            except Exception as exc:
+                log("tts: feed failed:", exc)
+
+    def end_stream(self, timeout=180):
+        """Wait for everything fed so far to finish synthesizing and playing."""
+        started = time.time()
+        while self.pending > 0 and time.time() - started < timeout:
+            if self.discard:
+                return
+            if self.done.wait(timeout=0.3):
+                self.done.clear()
+        samples = self.stream_samples or (self.bytes_out // 2)
+        if not samples:
+            return
+        duration = samples / self.rate
+        origin = self.first_byte_at or started
+        drain = float(self.cfg.get("ttsDrainSeconds", 0.5))
+        log(f"tts: {duration:.2f}s audio streamed in {time.time() - started:.2f}s")
+
+        # Playback ends at whichever comes later.
+        #
+        # If synthesis outran playback, audio is queued and finishes a full
+        # duration after the first sample. If synthesis fell behind — which
+        # it does here, "9.07s audio streamed in 16.01s" — the speaker was
+        # starved and is still working through the tail well after that
+        # point. Taking only the first estimate reopened the microphone into
+        # the end of her own sentence, which came back as a command.
+        deadline = max(origin + duration, (self.last_byte_at or origin)) + drain
+        while time.time() < deadline:
+            if self.discard:
+                break
+            time.sleep(0.05)
 
     def speak(self, text):
         """Blocking: returns once the last sample has actually been heard, so
@@ -1276,7 +1376,8 @@ class Voice:
         # the microphone into Juno's own voice. She then transcribed herself
         # and answered it.
         origin = self.first_byte_at or started
-        deadline = origin + duration + float(self.cfg.get("ttsDrainSeconds", 0.5))
+        deadline = max(origin + duration, (self.last_byte_at or origin)) \
+            + float(self.cfg.get("ttsDrainSeconds", 0.5))
         while time.time() < deadline:
             if self.discard:
                 break
@@ -1304,6 +1405,20 @@ def shell_quote(s):
     return "'" + str(s).replace("'", "'\\''") + "'"
 
 
+SPOKEN_AS = {
+    # Kokoro reads this as "Shreynch". A phonetic respelling is the only
+    # control it offers over pronunciation, and it applies to the spoken
+    # audio only — the panel still shows the name spelled properly.
+    # e.g. "shreyansh": "Shray-ahnsh"
+}
+
+
+def respell(text):
+    for written, spoken in SPOKEN_AS.items():
+        text = re.sub(rf"\b{re.escape(written)}\b", spoken, text, flags=re.IGNORECASE)
+    return text
+
+
 def tts_clean(text):
     """Strip everything that sounds like punctuation soup when spoken."""
     text = re.sub(r"```.*?```", " (code omitted) ", str(text or ""), flags=re.S)
@@ -1315,7 +1430,7 @@ def tts_clean(text):
     text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
     text = re.sub(r"https?://\S+", "a link", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:1400]
+    return respell(text)[:1400]
 
 
 def play(path):
@@ -1338,6 +1453,8 @@ class Claude:
         self.last_turn = 0.0
         self.proc = None
         self.cancelled = False
+        self.sentence_buffer = ""
+        self.on_sentence = None
 
     def available(self):
         return bool(self.binary and os.path.exists(self.binary))
@@ -1370,7 +1487,7 @@ class Claude:
                 cmd += ["--settings", settings]
         return cmd
 
-    def ask(self, prompt, unguarded=False):
+    def ask(self, prompt, unguarded=False, on_sentence=None):
         """Run one turn, streaming events onto the bus. Returns the reply."""
         self.cancelled = False
         workspace = os.path.expanduser(self.cfg["workspace"])
@@ -1391,6 +1508,8 @@ class Claude:
 
         reply = []
         tools = {}
+        self.sentence_buffer = ""
+        self.on_sentence = on_sentence
         for line in self.proc.stdout:
             line = line.strip()
             if not line:
@@ -1400,6 +1519,8 @@ class Claude:
             except json.JSONDecodeError:
                 continue
             self.handle_event(event, reply, tools)
+            self.flush_sentences()
+        self.flush_sentences(final=True)
         err = ""
         with contextlib.suppress(Exception):
             err = self.proc.stderr.read() or ""
@@ -1414,6 +1535,30 @@ class Claude:
             return ""
         self.last_turn = time.time()
         return text
+
+    # A sentence ends at punctuation followed by a space, or at the end of
+    # the reply. Anything shorter than this is not worth a synthesis call;
+    # anything longer delays the first word out of the speaker.
+    SENTENCE_END = re.compile(r"(.+?[.!?…।])(\s+|$)", re.S)
+
+    def flush_sentences(self, final=False):
+        """Hand finished sentences to the voice while Claude is still writing
+        the rest. The reply used to be synthesized only after the last token
+        arrived, so the user waited for generation and synthesis end to end
+        rather than overlapping them."""
+        if not self.on_sentence:
+            return
+        while True:
+            match = self.SENTENCE_END.match(self.sentence_buffer)
+            if not match:
+                break
+            sentence = match.group(1).strip()
+            self.sentence_buffer = self.sentence_buffer[match.end():]
+            if sentence:
+                self.on_sentence(sentence)
+        if final and self.sentence_buffer.strip():
+            self.on_sentence(self.sentence_buffer.strip())
+            self.sentence_buffer = ""
 
     def handle_event(self, event, reply, tools):
         kind = event.get("type")
@@ -1442,6 +1587,7 @@ class Claude:
                     chunk = delta.get("text") or ""
                     if chunk:
                         reply.append(chunk)
+                        self.sentence_buffer += chunk
                         BUS.emit(t="delta", text=chunk)
                 elif delta.get("type") == "thinking_delta":
                     BUS.emit(t="thinking", text=delta.get("thinking") or "")
@@ -1746,7 +1892,10 @@ class Juno:
         elif cmd == "ask":
             text = str(msg.get("text") or "").strip()
             if text:
-                self.jobs.put(("ask", text))
+                # Typed questions are silent by default; --speak makes one
+                # behave exactly like a spoken turn, which is the only way to
+                # exercise the voice path without a microphone.
+                self.jobs.put(("ask_spoken" if msg.get("speak") else "ask", text))
         elif cmd == "cancel":
             self.claude.cancel()
             self.voice.stop()
@@ -1820,6 +1969,8 @@ class Juno:
                     self.begin_listening(manual=True)
                 elif kind == "ask":
                     self.answer(payload, spoken=False)
+                elif kind == "ask_spoken":
+                    self.answer(payload, spoken=True)
                 elif kind == "unguarded":
                     self.answer(payload, spoken=False, unguarded=True)
             except Exception as exc:
@@ -1923,7 +2074,32 @@ class Juno:
         BUS.emit(t="user", text=prompt)
         self.set_state(THINKING)
 
-        reply = self.claude.ask(prompt, unguarded=unguarded)
+        # Speak while Claude is still writing. The microphone shuts before
+        # the first sample rather than after the last token, so she cannot
+        # hear her own opening sentence either.
+        streaming = bool(spoken and self.cfg.get("speak", True)
+                         and self.voice.available()
+                         and self.cfg.get("streamSpeech", True))
+        on_sentence = None
+        if streaming and self.voice.begin_stream():
+            self.tts_until = time.time() + 3600
+            self.set_state(SPEAKING)
+
+            def on_sentence(sentence):
+                self.voice.feed(sentence)
+        else:
+            streaming = False
+
+        try:
+            reply = self.claude.ask(prompt, unguarded=unguarded,
+                                    on_sentence=on_sentence)
+        finally:
+            if streaming:
+                try:
+                    self.voice.end_stream()
+                finally:
+                    self.tts_until = time.time() + float(
+                        self.cfg.get("micReopenDelay", 1.4))
 
         if self.claude.cancelled:
             self.set_state(IDLE)
@@ -1936,7 +2112,8 @@ class Juno:
         self.remember("assistant", reply)
         BUS.emit(t="assistant", text=reply)
 
-        if spoken and self.cfg.get("speak", True) and self.voice.available():
+        if not streaming and spoken and self.cfg.get("speak", True) \
+                and self.voice.available():
             self.set_state(SPEAKING)
             self.say(reply)
 

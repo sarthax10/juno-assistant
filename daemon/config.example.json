@@ -85,5 +85,6 @@
   "wakePhrases": "HEY JARVIS,JARVIS",
   "wakeKwsScore": 8.0,
   "wakeKwsThreshold": 0.01,
-  "micSource": "default"
+  "micSource": "default",
+  "streamSpeech": true
 }
