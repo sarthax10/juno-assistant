@@ -21,6 +21,29 @@ CFG = os.path.expanduser("~/.config/juno/config.json")
 SECONDS = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 
 
+def check_lid():
+    """The built-in microphone array lives in the laptop chassis. Closed, it
+    is muffled and pointed at nothing, which is invisible from software
+    except as audio that never contains you."""
+    lines = []
+    try:
+        for path in ("/proc/acpi/button/lid/LID/state",
+                     "/proc/acpi/button/lid/LID0/state"):
+            if os.path.exists(path):
+                if "closed" in open(path).read():
+                    lines.append("\n  Your laptop lid is CLOSED, and the only working microphone")
+                    lines.append("  is the array built into the laptop. Open the lid, or plug in")
+                    lines.append("  a headset — the headphone jack has a microphone input and it")
+                    lines.append("  would sit centimetres from your mouth instead of inside a")
+                    lines.append("  shut laptop across the desk.")
+                break
+    except Exception:
+        pass
+    if not lines:
+        lines.append("\n  Move closer to the microphone, or plug in a headset.")
+    return "\n".join(lines)
+
+
 def record(seconds, source):
     cmd = ["timeout", str(seconds + 1), "pw-record", "--raw", "--rate", "16000",
            "--channels", "1", "--format", "s16"]
@@ -110,10 +133,26 @@ def main():
     levels = sorted(float(np.sqrt(np.mean(f.astype(np.float64) ** 2)) / 32768)
                     for f in frames)
     median, peak = levels[len(levels) // 2], levels[-1]
+    floor = levels[len(levels) // 10]
+    # Someone talking near a microphone makes the level jump; ambient room
+    # audio sits flat. This ratio separates "you were not heard" from "you
+    # were heard and misunderstood", which are completely different faults.
+    dynamic = peak / max(floor, 1e-6)
 
     print()
     print(f"  background level   {median:.4f}   (a quiet room is about 0.005)")
     print(f"  loudest moment     {peak:.4f}")
+    print(f"  dynamic range      {dynamic:.1f}x   (speaking near a mic gives >8x)")
+
+    if dynamic < 4.0:
+        print()
+        print("  NO CLOSE SPEECH IN THIS RECORDING.")
+        print("  The level never rose above the room, so nothing you said reached")
+        print("  the microphone. This is not a recognition problem and no setting")
+        print("  will fix it.")
+        print(check_lid())
+        print(f"\n  recording kept at /tmp/miccheck.wav")
+        return 1
 
     engine = cfg.get("wakeEngine", "sherpa")
     if engine == "sherpa":
