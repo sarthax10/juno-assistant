@@ -198,7 +198,7 @@ back on if you want it.
 The Hindi is deliberately spoken, not literary. Technical words stay in
 English because that is how people actually talk:
 
-> **आपके laptop में 8 CPU cores हैं, Shreyansh।**
+> **आपके laptop में 8 CPU cores हैं, the user।**
 
 not `आपके संगणक में आठ संसाधन-केंद्र हैं`, which no one has ever said out loud.
 
@@ -403,7 +403,7 @@ now shows a red banner when muted; click it to unmute, or run `juno unmute`.
 sat `SUSPENDED` with Juno's capture stream still attached, so the read never
 returned and the daemon reported "capture started" while hearing nothing for
 twenty minutes. `pactl list short sources` shows the state; direct ALSA
-capture (`arecord -D hw:0,6`) still working while `pw-record` returns zero
+capture (`arecord -D hw:0,N`) still working while `pw-record` returns zero
 bytes confirms PipeWire rather than the driver. The fix:
 
 ```bash
@@ -470,28 +470,16 @@ rm -rf ~/.cache/quickshell/qmlcache && omarchy restart shell
 ```
 
 
-## A hardware note
+## A note on the machine this was built for
 
-This laptop's CPU is running at **1200 MHz on every core under full load** —
-half its 2.4 GHz base clock, and 28% of its 4.2 GHz turbo. Measured with all
-eight cores busy.
+Everything here was tuned on a laptop whose CPU sits at 1200 MHz under load —
+half its rated base clock, with tens of thousands of package-throttle events
+and no software cause (governor, energy preference, platform profile and
+power limits all nominal, temperatures well under limit). Model choices,
+thread counts and the decision to keep nothing running while idle all follow
+from that.
 
-It is not a software setting. The governor is `powersave` (correct for
-`intel_pstate`), the energy preference is `performance`, the platform profile
-is `performance`, `max_perf_pct` is 100, turbo is enabled, and the machine is
-on a 65 W USB-C PD charger at 64 °C — comfortably under the 100 °C limit.
-And yet:
-
-```
-package_throttle_count:         12627
-package_throttle_total_time_ms: 50751
-```
-
-Something below the operating system is clamping the package. On this class
-of laptop that is usually BD PROCHOT asserted by another component, or an EC
-firmware quirk — a BIOS/EC update is the usual fix, and `throttled`-style
-tools can confirm it.
-
-Everything in Juno is two to three times slower than it should be because of
-this. Every latency number above was measured on the throttled clock, so they
-are a floor, not a ceiling.
+On a machine that clocks normally, the larger models become affordable and
+`sttModelAccurate` is worth turning back on. The measurement tools included
+here — `juno-eval` in particular — exist so those choices can be re-made
+against your own hardware and your own voice rather than inherited.

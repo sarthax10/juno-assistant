@@ -3,7 +3,7 @@
   "id": "juno.assistant",
   "name": "Jarvis",
   "version": "1.0.0",
-  "author": "shreyanshsarthak10",
+  "author": "sarthax10",
   "license": "MIT",
   "description": "A wake-word voice assistant. Say \"Hey Jarvis\" and Claude answers out loud, with a live view of everything it does.",
   "kinds": [
