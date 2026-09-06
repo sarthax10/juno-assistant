@@ -210,6 +210,9 @@ DEFAULTS = {
     "micMuted": False,
     # Restart the capture if no audio arrives for this long.
     "micStallSeconds": 12,
+    # How long a pinned device may deliver silence before Juno goes looking
+    # for one that is actually carrying sound.
+    "deadDeviceSeconds": 25,
     # The capture device, by name. "default" follows the system default and
     # inherits its habit of wandering off. `pactl list short sources` lists
     # the names.
@@ -622,6 +625,7 @@ class Microphone(threading.Thread):
         self.peak = 0.0
         self.tick = 0
         self.last_frame_at = time.time()
+        self.silent_since = 0.0
         self.frames_seen = 0
 
     def stop(self):
@@ -666,6 +670,63 @@ class Microphone(threading.Thread):
             log("mic: capture ended, restarting in 1s")
             time.sleep(1.0)
 
+    def check_dead_device(self, frame):
+        """An unplugged headset jack streams flawlessly and carries digital
+        silence. Juno sat on one for twenty minutes hearing nothing while
+        every health check stayed green, because the bytes were arriving on
+        time — they were just all zero."""
+        peak = max(abs(int.from_bytes(frame[i:i+2], "little", signed=True))
+                   for i in range(0, len(frame), 64)) / 32768
+        if peak > 0.0015:
+            self.silent_since = 0.0
+            return
+        now = time.time()
+        if not self.silent_since:
+            self.silent_since = now
+            return
+        if now - self.silent_since < float(self.cfg.get("deadDeviceSeconds", 25)):
+            return
+        self.silent_since = 0.0
+        better = self.find_live_source()
+        if not better:
+            return
+        log(f"mic: {self.cfg.get('micSource', 'default')} is silent — "
+            f"switching to {better}")
+        BUS.emit(t="mic_switched", source=better)
+        self.cfg["micSource"] = better
+        with contextlib.suppress(Exception):
+            self.proc.terminate()
+
+    def find_live_source(self):
+        """Whichever input is actually carrying sound."""
+        try:
+            listing = subprocess.run(["pactl", "list", "short", "sources"],
+                                     capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return None
+        current = self.cfg.get("micSource", "")
+        best, best_peak = None, 0.0
+        for line in listing.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2 or ".monitor" in parts[1] or parts[1] == current:
+                continue
+            name = parts[1]
+            try:
+                probe = subprocess.run(
+                    ["timeout", "2", "pw-record", "--target", name, "--raw",
+                     "--rate", "16000", "--channels", "1", "--format", "s16", "-"],
+                    capture_output=True, timeout=6).stdout
+            except Exception:
+                continue
+            if len(probe) < 3200:
+                continue
+            samples = array.array("h")
+            samples.frombytes(probe[:len(probe) // 2 * 2])
+            peak = max(abs(v) for v in samples) / 32768 if samples else 0
+            if peak > best_peak:
+                best, best_peak = name, peak
+        return best if best_peak > 0.0015 else None
+
     def watchdog(self, proc):
         """A capture that stops delivering does not raise anything — the read
         just never returns, and Juno goes deaf in total silence. This happened:
@@ -708,6 +769,7 @@ class Microphone(threading.Thread):
 
     def consume(self, frame):
         self.last_frame_at = time.time()
+        self.check_dead_device(frame)
         # The wake detector sees the raw stream, ahead of the mute gate and
         # the VAD, because it does its own noise handling and needs
         # continuity to recognise a phrase.
@@ -1939,6 +2001,18 @@ class Juno:
         through the audio queue, and it does not wait for a transcript."""
         if self.state == LISTENING:
             return
+
+        if self.state in (THINKING, SPEAKING):
+            # Barge-in means listening while she talks, so the loudest voice
+            # in the microphone is hers. A cold wake can afford a low bar
+            # because the room is quiet; an interrupt cannot, or she talks
+            # herself out of her own sentence.
+            floor = float(self.cfg.get("wakeInterruptThreshold", 0.6))
+            if score < floor:
+                log(f"wake: ignored ({score:.2f}) — below the "
+                    f"interrupt bar of {floor} while {self.state}")
+                return
+
         log(f"wake: detected ({score:.2f}) in state {self.state}")
 
         if self.state in (THINKING, SPEAKING):
@@ -2056,6 +2130,7 @@ class Juno:
             except queue.Empty:
                 self.expire_follow_up()
                 self.expire_overlay()
+                self.expire_stuck_state()
                 continue
             try:
                 if kind == "audio":
@@ -2080,6 +2155,29 @@ class Juno:
                 log("worker:", exc)
                 BUS.emit(t="error", message=str(exc)[:200])
                 self.set_state(IDLE)
+
+    def expire_stuck_state(self):
+        """Nothing should hold a state forever.
+
+        A failed interrupt left her in SPEAKING with no speech running and no
+        path out — silent, unwakeable, and reporting perfect health. Any
+        non-idle state that outlives what it could plausibly be doing is a
+        bug that has already happened, so recover from it rather than wait to
+        be restarted."""
+        limit = float(self.cfg.get("maxStateSeconds", 180))
+        if self.state == IDLE or not limit:
+            return
+        if time.time() - self.state_since < limit:
+            return
+        log(f"state: stuck in {self.state} for {limit:.0f}s — resetting")
+        BUS.emit(t="recovered", was=self.state)
+        with contextlib.suppress(Exception):
+            self.claude.cancel()
+        with contextlib.suppress(Exception):
+            self.voice.stop()
+        self.tts_until = 0.0
+        self.follow_turns = 0
+        self.set_state(IDLE)
 
     def expire_overlay(self):
         if self.hide_at and time.time() > self.hide_at:

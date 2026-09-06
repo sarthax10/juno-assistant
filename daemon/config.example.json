@@ -75,7 +75,7 @@
   "maxPendingSegments": 2,
   "maxSegmentAgeSeconds": 8,
   "wakeModel": "hey_jarvis_v0.1.onnx",
-  "wakeThreshold": 0.2,
+  "wakeThreshold": 0.14,
   "wakeCooldownSeconds": 1.5,
   "transcriptWakeFallback": false,
   "sttModelAccurate": "small",
@@ -87,5 +87,8 @@
   "wakeKwsThreshold": 0.01,
   "micSource": "default",
   "streamSpeech": true,
-  "userName": ""
+  "userName": "",
+  "wakeInterruptThreshold": 0.6,
+  "maxStateSeconds": 180,
+  "deadDeviceSeconds": 25
 }
