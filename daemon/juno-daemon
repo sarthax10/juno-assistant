@@ -135,8 +135,13 @@ DEFAULTS = {
     # Multilingual by default. ggml-base.en.bin is roughly twice as fast
     # but cannot hear anything except English.
     "model": os.path.join(SHARE, "models/ggml-small.bin"),
-    # "auto" detects per utterance; "en" or "hi" pins it and is faster.
-    "whisperLanguage": "auto",
+    # Pinned, not detected. Language detection needs more audio than a
+    # spoken command contains: on five-second clips it identified English
+    # eight times out of eight, and on the two-second segments real commands
+    # produce it returned Turkish, Dutch, Korean and Arabic, then decoded the
+    # audio as those languages and returned nonsense. Since Juno answers in
+    # English regardless, there is nothing to gain from guessing.
+    "whisperLanguage": "en",
     "whisperThreads": 8,
     # base is the largest that answers in a usable time on this
     # CPU. "small" is noticeably more accurate and several times
@@ -149,13 +154,12 @@ DEFAULTS = {
     "sttCompute": "int8",
     # Used only for commands, never while waiting for the wake word.
     #
-    # Empty means "the fast model is good enough", which on this user's own
-    # recordings it is: measured on eight real utterances, base scored 10%
-    # word error in 1.6s a clip and small scored 5% in 4.5s. Three times the
-    # wait for five points is the wrong trade for something you talk to.
-    # Earlier synthetic tests said the opposite; they were wrong, because
-    # text-to-speech is not a person.
-    "sttModelAccurate": "",
+    # On this user's own recordings base scored 10% word error in 1.6s a clip
+    # and small 5% in 4.5s. Being misunderstood costs more than three seconds
+    # does — especially since most of the wait a person notices was removed
+    # elsewhere, by speaking each sentence as it is written rather than after
+    # the last one. Set to "" to use the fast model for commands too.
+    "sttModelAccurate": "small",
     "whisperPort": 8642,
     # Given as decoding context so whisper spells the name instead of
     # hearing it as ordinary English.
@@ -750,7 +754,10 @@ class Microphone(threading.Thread):
 
         if not self.speaking:
             self.preroll.append(frame)
-            if len(self.preroll) > 15:            # 300ms of lead-in
+            # Half a second of lead-in. At 300ms the first word was being
+            # clipped when someone started talking right as the gate opened —
+            # "what time is it" arrived as "time is a tight".
+            if len(self.preroll) > 25:
                 self.preroll.pop(0)
             if raw > start_gate:
                 self.speaking = True
