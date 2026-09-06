@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+Record from every microphone at once and report which one actually hears you.
+
+Choosing an input by name is guesswork — a headset jack exists whether or not
+anything is plugged into it, and a laptop's built-in array keeps working while
+picking up the room instead of the person. This records all of them
+simultaneously while you talk, then ranks them by how far your voice rose
+above the background, and offers to pin the winner.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+CFG = os.path.expanduser("~/.config/juno/config.json")
+SECONDS = int(sys.argv[1]) if len(sys.argv) > 1 else 6
+
+
+def sources():
+    out = subprocess.run(["pactl", "list", "short", "sources"],
+                         capture_output=True, text=True).stdout
+    found = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or ".monitor" in parts[1]:
+            continue
+        found.append(parts[1])
+    return found
+
+
+def describe(name):
+    out = subprocess.run(["pactl", "list", "sources"], capture_output=True, text=True).stdout
+    block = out.split(f"Name: {name}")
+    if len(block) < 2:
+        return name
+    for line in block[1].splitlines():
+        if "Description:" in line:
+            return line.split("Description:", 1)[1].strip()
+    return name
+
+
+def analyse(raw):
+    if not raw:
+        return None
+    a = np.frombuffer(raw, dtype=np.int16)
+    if len(a) < 3200:
+        return None
+    f = np.array([np.sqrt(np.mean(a[i:i + 320].astype(np.float64) ** 2)) / 32768
+                  for i in range(0, len(a) - 320, 320)])
+    f.sort()
+    floor = float(f[len(f) // 10])
+    peak = float(f[-1])
+    return {"floor": floor, "median": float(f[len(f) // 2]), "peak": peak,
+            "dynamic": peak / max(floor, 1e-6)}
+
+
+def main():
+    names = sources()
+    if not names:
+        print("No capture devices at all.")
+        return 1
+
+    print("Recording from every microphone at once.")
+    print(f'Say "Hey Jarvis" a couple of times over the next {SECONDS} seconds.\n')
+    for n in names:
+        print(f"  - {describe(n)}")
+    input("\nPress Enter to start... ")
+
+    procs = {}
+    for n in names:
+        procs[n] = subprocess.Popen(
+            ["timeout", str(SECONDS + 1), "pw-record", "--target", n, "--raw",
+             "--rate", "16000", "--channels", "1", "--format", "s16", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    print("listening...", flush=True)
+    results = {}
+    for n, p in procs.items():
+        results[n] = analyse(p.stdout.read())
+        p.wait()
+
+    print("\n" + "=" * 66)
+    ranked = []
+    for n, r in results.items():
+        label = describe(n)
+        if not r:
+            print(f"  {label[:52]:<52} no audio")
+            continue
+        verdict = ("HEARD YOU" if r["dynamic"] >= 8 else
+                   "weak" if r["dynamic"] >= 4 else "only room noise")
+        print(f"  {label[:52]:<52} {r['dynamic']:5.1f}x  {verdict}")
+        ranked.append((r["dynamic"], n, label))
+
+    if not ranked:
+        print("\nNothing recorded on any device.")
+        return 1
+    ranked.sort(reverse=True)
+    best, name, label = ranked[0]
+    print("=" * 66)
+    if best < 4:
+        print("\nNone of them heard you — every device recorded flat room noise.")
+        print("Check that your headset is actually plugged in, and that you are")
+        print("speaking close to whichever microphone you intend to use.")
+        return 1
+
+    print(f"\nBest: {label}  ({best:.1f}x)")
+    cfg = json.load(open(CFG)) if os.path.exists(CFG) else {}
+    if cfg.get("micSource") == name:
+        print("That is already the one in use.")
+        return 0
+    if input("Pin this as the microphone? [Y/n] ").strip().lower() in ("", "y", "yes"):
+        cfg["micSource"] = name
+        json.dump(cfg, open(CFG, "w"), indent=2, ensure_ascii=False)
+        subprocess.run(["systemctl", "--user", "restart", "juno.service"])
+        print("Pinned and restarted.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

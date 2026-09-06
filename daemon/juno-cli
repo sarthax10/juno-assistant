@@ -20,6 +20,7 @@ USAGE = """juno — voice assistant control
   juno say <text>        speak a line in Juno's voice
   juno enroll [takes]    train the wake word on your own voice
   juno eval [secs]       measure accuracy on YOUR voice, not synthetic
+  juno mic [secs]        test every microphone and pick the one that hears you
   juno miccheck [secs]   record yourself and score the wake word
   juno sensitivity [n]   show or set wake sensitivity (higher = easier)
   juno cancel            stop the current turn
@@ -128,6 +129,9 @@ def main():
     if cmd in ("enroll", "train"):
         os.execv(os.path.expanduser("~/.local/share/juno/juno-enroll"),
                  ["juno-enroll"] + rest)
+    if cmd in ("mic", "micpick", "pickmic"):
+        os.execv(os.path.expanduser("~/.local/share/juno/juno-micpick"),
+                 ["juno-micpick"] + rest)
     if cmd in ("miccheck", "testmic", "mictest"):
         os.execv(os.path.expanduser("~/.local/share/juno/juno-miccheck"),
                  ["juno-miccheck"] + rest)
