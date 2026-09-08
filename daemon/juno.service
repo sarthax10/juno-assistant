@@ -13,5 +13,8 @@ RestartSec=3
 Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
 Slice=app.slice
 
+# Deliberately not enabled at login. `jarvis start` is the only
+# thing that runs it, so an assistant that listens to the room
+# is never listening because nobody turned it off.
 [Install]
 WantedBy=graphical-session.target

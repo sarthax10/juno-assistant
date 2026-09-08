@@ -29,7 +29,8 @@ USAGE = """juno — voice assistant control
   juno quiet / speak     toggle the spoken voice
   juno clear             forget the conversation
   juno status            one-shot health snapshot
-  juno start/stop/restart/logs    manage the background service
+  juno start / stop      run it, or shut it down entirely
+  juno restart / logs    restart, or follow the log
 """
 
 
@@ -89,10 +90,30 @@ def stream():
 
 
 def service(action):
+    """Start and stop cover the desktop plugin as well as the daemon.
+
+    They are two pieces — a background service and a Quickshell plugin — and
+    starting only one leaves either a voice with no window or a window with
+    nothing behind it. Neither is enabled at login; this is the only thing
+    that turns them on.
+    """
     unit = "juno.service"
     if action == "logs":
         os.execvp("journalctl", ["journalctl", "--user", "-u", unit, "-f", "-n", "80"])
+
+    if action in ("start", "restart"):
+        subprocess.run(["omarchy", "plugin", "enable", "juno.assistant"],
+                       capture_output=True)
     subprocess.run(["systemctl", "--user", action, unit])
+    if action == "stop":
+        subprocess.run(["omarchy", "plugin", "disable", "juno.assistant"],
+                       capture_output=True)
+
+    if action in ("start", "restart"):
+        print("Jarvis is running. It will NOT come back on its own after a "
+              "reboot — run `jarvis start` again.")
+    elif action == "stop":
+        print("Jarvis stopped, and the desktop plugin with it.")
     return 0
 
 
